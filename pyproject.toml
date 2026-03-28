@@ -1,0 +1,79 @@
+[project]
+name = "lumivox-linklab"
+version = "0.1.0"
+description = "Typed communication protocol for local voice-agent clients and servers"
+authors = [
+    {name = "ReanGD", email = "reangd@gmail.com"},
+]
+requires-python = ">=3.13,<3.15"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+keywords = [
+    "audio",
+    "msgpack",
+    "voice-assistant",
+    "websocket",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "lumivox-core @ git+https://github.com/LumivoxAI/core.git@master",
+    "msgpack>=1.1,<2",
+    "websockets>=15,<17",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = [
+    "justfile",
+    "uv.lock",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18,<2",
+    "pytest>=9,<10",
+    "ruff>=0.14,<0.15",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = []
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+length-sort = true
+
+[tool.mypy]
+files = ["src/lumivox_linklab", "tests"]
+python_version = "3.13"
+strict = true
+warn_unreachable = true
+
+[project.urls]
+Homepage = "https://github.com/LumivoxAI/linklab"
+Documentation = "https://github.com/LumivoxAI/linklab"
+Issues = "https://github.com/LumivoxAI/linklab/issues"
+Source = "https://github.com/LumivoxAI/linklab"
