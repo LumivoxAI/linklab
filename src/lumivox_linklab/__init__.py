@@ -1,3 +1,4 @@
+from ._codec import decode_message
 from ._enums import (
     ErrorCode,
     ErrorScope,
@@ -77,6 +78,7 @@ __all__ = [
     "ConversationEndedEvent",
     "ConversationId",
     "ConversationStartedEvent",
+    "decode_message",
     "EndpointRole",
     "ErrorCode",
     "ErrorEvent",
