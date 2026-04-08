@@ -42,9 +42,17 @@ test:
 test_all:
     uv run --all-groups --all-extras pytest
 
+# Regenerate the reviewable v1 MessagePack golden manifest explicitly.
+fixtures:
+    uv run python tools/generate_golden_fixtures.py
+
+# Verify that committed golden bytes match the canonical encoder.
+fixtures_check:
+    uv run python tools/generate_golden_fixtures.py --check
+
 # Build artifacts without local uv source overrides.
 build:
     uv build --no-sources --clear
 
 # Run the fast, required checks before creating a commit.
-precommit: fmt_check lint typecheck test lock_check
+precommit: fmt_check lint typecheck test fixtures_check lock_check

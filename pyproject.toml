@@ -38,7 +38,9 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 source-include = [
+    "fixtures/**",
     "justfile",
+    "tools/generate_golden_fixtures.py",
     "uv.lock",
 ]
 

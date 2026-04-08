@@ -1,0 +1,330 @@
+{
+  "fixtures": [
+    {
+      "direction": "client_to_server",
+      "message": {
+        "agent": "golden-client",
+        "capabilities": [
+          "barge_in",
+          "playback_accounting",
+          "speech_spans"
+        ],
+        "input_format": {
+          "channels": 1,
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 16000
+        },
+        "output_formats": [
+          {
+            "channels": 1,
+            "encoding": "pcm_s16le",
+            "sample_rate_hz": 24000
+          },
+          {
+            "channels": 1,
+            "encoding": "pcm_s16le",
+            "sample_rate_hz": 16000
+          }
+        ],
+        "type": "hello",
+        "version": 1
+      },
+      "name": "client-hello",
+      "wire_hex": "86a56167656e74ad676f6c64656e2d636c69656e74ac6361706162696c697469657393a862617267655f696eb3706c61796261636b5f6163636f756e74696e67ac7370656563685f7370616e73ac696e7075745f666f726d617483a86368616e6e656c7301a8656e636f64696e67a970636d5f7331366c65ae73616d706c655f726174655f687acd3e80ae6f75747075745f666f726d6174739283a86368616e6e656c7301a8656e636f64696e67a970636d5f7331366c65ae73616d706c655f726174655f687acd5dc083a86368616e6e656c7301a8656e636f64696e67a970636d5f7331366c65ae73616d706c655f726174655f687acd3e80a474797065a568656c6c6fa776657273696f6e01"
+    },
+    {
+      "direction": "client_to_server",
+      "message": {
+        "activation": "wake_word",
+        "conversation_id": 1,
+        "type": "conversation.start",
+        "wake_word": "lumi"
+      },
+      "name": "conversation-start",
+      "wire_hex": "84aa61637469766174696f6ea977616b655f776f7264af636f6e766572736174696f6e5f696401a474797065b2636f6e766572736174696f6e2e7374617274a977616b655f776f7264a46c756d69"
+    },
+    {
+      "direction": "client_to_server",
+      "message": {
+        "conversation_id": 1,
+        "generation": 0,
+        "input_id": 1,
+        "reason": "activation",
+        "type": "input.start"
+      },
+      "name": "input-start",
+      "wire_hex": "85af636f6e766572736174696f6e5f696401aa67656e65726174696f6e00a8696e7075745f696401a6726561736f6eaa61637469766174696f6ea474797065ab696e7075742e7374617274"
+    },
+    {
+      "direction": "client_to_server",
+      "message": {
+        "conversation_id": 1,
+        "generation": 1,
+        "input_id": 2,
+        "interrupts_response_id": 1,
+        "reason": "barge_in",
+        "type": "input.start"
+      },
+      "name": "input-start-barge-in",
+      "wire_hex": "86af636f6e766572736174696f6e5f696401aa67656e65726174696f6e01a8696e7075745f696402b6696e74657272757074735f726573706f6e73655f696401a6726561736f6ea862617267655f696ea474797065ab696e7075742e7374617274"
+    },
+    {
+      "direction": "client_to_server",
+      "message": {
+        "audio": {
+          "$binary_hex": "01020304"
+        },
+        "conversation_id": 1,
+        "input_id": 1,
+        "speech": true,
+        "start_frame": 0,
+        "type": "input.audio"
+      },
+      "name": "input-audio",
+      "wire_hex": "86a5617564696fc40401020304af636f6e766572736174696f6e5f696401a8696e7075745f696401a6737065656368c3ab73746172745f6672616d6500a474797065ab696e7075742e617564696f"
+    },
+    {
+      "direction": "client_to_server",
+      "message": {
+        "conversation_id": 1,
+        "input_id": 1,
+        "reason": "capture_failed",
+        "type": "input.abort"
+      },
+      "name": "input-abort",
+      "wire_hex": "84af636f6e766572736174696f6e5f696401a8696e7075745f696401a6726561736f6eae636170747572655f6661696c6564a474797065ab696e7075742e61626f7274"
+    },
+    {
+      "direction": "client_to_server",
+      "message": {
+        "conversation_id": 1,
+        "output_id": 1,
+        "played_frames": 2,
+        "response_id": 1,
+        "type": "playback.finished"
+      },
+      "name": "playback-finished",
+      "wire_hex": "85af636f6e766572736174696f6e5f696401a96f75747075745f696401ad706c617965645f6672616d657302ab726573706f6e73655f696401a474797065b1706c61796261636b2e66696e6973686564"
+    },
+    {
+      "direction": "client_to_server",
+      "message": {
+        "conversation_id": 1,
+        "output_id": 1,
+        "played_frames": 1,
+        "position": "estimated",
+        "reason": "barge_in",
+        "response_id": 1,
+        "type": "playback.interrupted"
+      },
+      "name": "playback-interrupted",
+      "wire_hex": "87af636f6e766572736174696f6e5f696401a96f75747075745f696401ad706c617965645f6672616d657301a8706f736974696f6ea9657374696d61746564a6726561736f6ea862617267655f696eab726573706f6e73655f696401a474797065b4706c61796261636b2e696e746572727570746564"
+    },
+    {
+      "direction": "client_to_server",
+      "message": {
+        "conversation_id": 1,
+        "reason": "user",
+        "type": "conversation.cancel"
+      },
+      "name": "conversation-cancel",
+      "wire_hex": "83af636f6e766572736174696f6e5f696401a6726561736f6ea475736572a474797065b3636f6e766572736174696f6e2e63616e63656c"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "agent": "golden-server",
+        "capabilities": [
+          "barge_in",
+          "playback_accounting",
+          "speech_spans"
+        ],
+        "limits": {
+          "idle_timeout_ms": 120000,
+          "max_input_audio_frames": 1600,
+          "max_input_frames": 1920000,
+          "max_message_bytes": 262144,
+          "max_output_audio_frames": 2400,
+          "max_text_bytes": 16384
+        },
+        "output_format": {
+          "channels": 1,
+          "encoding": "pcm_s16le",
+          "sample_rate_hz": 24000
+        },
+        "type": "hello",
+        "version": 1
+      },
+      "name": "server-hello",
+      "wire_hex": "86a56167656e74ad676f6c64656e2d736572766572ac6361706162696c697469657393a862617267655f696eb3706c61796261636b5f6163636f756e74696e67ac7370656563685f7370616e73a66c696d69747386af69646c655f74696d656f75745f6d73ce0001d4c0b66d61785f696e7075745f617564696f5f6672616d6573cd0640b06d61785f696e7075745f6672616d6573ce001d4c00b16d61785f6d6573736167655f6279746573ce00040000b76d61785f6f75747075745f617564696f5f6672616d6573cd0960ae6d61785f746578745f6279746573cd4000ad6f75747075745f666f726d617483a86368616e6e656c7301a8656e636f64696e67a970636d5f7331366c65ae73616d706c655f726174655f687acd5dc0a474797065a568656c6c6fa776657273696f6e01"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "reason": "activation",
+        "revision": 1,
+        "state": "listening",
+        "type": "state"
+      },
+      "name": "state",
+      "wire_hex": "85af636f6e766572736174696f6e5f696401a6726561736f6eaa61637469766174696f6ea87265766973696f6e01a57374617465a96c697374656e696e67a474797065a57374617465"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "accepted_end_frame": 2,
+        "conversation_id": 1,
+        "input_id": 1,
+        "reason": "endpoint",
+        "type": "input.closed"
+      },
+      "name": "input-closed",
+      "wire_hex": "85b261636365707465645f656e645f6672616d6502af636f6e766572736174696f6e5f696401a8696e7075745f696401a6726561736f6ea8656e64706f696e74a474797065ac696e7075742e636c6f736564"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "input_id": 1,
+        "language": "en",
+        "revision": 1,
+        "text": "hello",
+        "type": "transcript.update"
+      },
+      "name": "transcript-update",
+      "wire_hex": "86af636f6e766572736174696f6e5f696401a8696e7075745f696401a86c616e6775616765a2656ea87265766973696f6e01a474657874a568656c6c6fa474797065b17472616e7363726970742e757064617465"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "input_id": 1,
+        "language": "en",
+        "text": "hello",
+        "type": "transcript.final"
+      },
+      "name": "transcript-final",
+      "wire_hex": "85af636f6e766572736174696f6e5f696401a8696e7075745f696401a86c616e6775616765a2656ea474657874a568656c6c6fa474797065b07472616e7363726970742e66696e616c"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "end_conversation": false,
+        "input_id": 1,
+        "response_id": 1,
+        "type": "response.start"
+      },
+      "name": "response-start",
+      "wire_hex": "85af636f6e766572736174696f6e5f696401b0656e645f636f6e766572736174696f6ec2a8696e7075745f696401ab726573706f6e73655f696401a474797065ae726573706f6e73652e7374617274"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "response_id": 1,
+        "sequence": 0,
+        "text": "hi",
+        "type": "response.text.delta"
+      },
+      "name": "response-text-delta",
+      "wire_hex": "85af636f6e766572736174696f6e5f696401ab726573706f6e73655f696401a873657175656e636500a474657874a26869a474797065b3726573706f6e73652e746578742e64656c7461"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "response_id": 1,
+        "text": "hi",
+        "type": "response.text.final"
+      },
+      "name": "response-text-final",
+      "wire_hex": "84af636f6e766572736174696f6e5f696401ab726573706f6e73655f696401a474657874a26869a474797065b3726573706f6e73652e746578742e66696e616c"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "output_id": 1,
+        "response_id": 1,
+        "type": "output.start"
+      },
+      "name": "output-start",
+      "wire_hex": "84af636f6e766572736174696f6e5f696401a96f75747075745f696401ab726573706f6e73655f696401a474797065ac6f75747075742e7374617274"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "audio": {
+          "$binary_hex": "01020304"
+        },
+        "conversation_id": 1,
+        "output_id": 1,
+        "response_id": 1,
+        "start_frame": 0,
+        "type": "output.audio"
+      },
+      "name": "output-audio",
+      "wire_hex": "86a5617564696fc40401020304af636f6e766572736174696f6e5f696401a96f75747075745f696401ab726573706f6e73655f696401ab73746172745f6672616d6500a474797065ac6f75747075742e617564696f"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "output_id": 1,
+        "response_id": 1,
+        "total_frames": 2,
+        "type": "output.end"
+      },
+      "name": "output-end",
+      "wire_hex": "85af636f6e766572736174696f6e5f696401a96f75747075745f696401ab726573706f6e73655f696401ac746f74616c5f6672616d657302a474797065aa6f75747075742e656e64"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "response_id": 1,
+        "type": "response.end"
+      },
+      "name": "response-end",
+      "wire_hex": "83af636f6e766572736174696f6e5f696401ab726573706f6e73655f696401a474797065ac726573706f6e73652e656e64"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "reason": "barge_in",
+        "response_id": 1,
+        "type": "response.cancelled"
+      },
+      "name": "response-cancelled",
+      "wire_hex": "84af636f6e766572736174696f6e5f696401a6726561736f6ea862617267655f696eab726573706f6e73655f696401a474797065b2726573706f6e73652e63616e63656c6c6564"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "conversation_id": 1,
+        "reason": "completed",
+        "type": "conversation.end"
+      },
+      "name": "conversation-end",
+      "wire_hex": "83af636f6e766572736174696f6e5f696401a6726561736f6ea9636f6d706c65746564a474797065b0636f6e766572736174696f6e2e656e64"
+    },
+    {
+      "direction": "server_to_client",
+      "message": {
+        "code": "tts_failed",
+        "conversation_id": 1,
+        "fatal": true,
+        "message": "safe diagnostic",
+        "response_id": 1,
+        "scope": "response",
+        "type": "error"
+      },
+      "name": "error",
+      "wire_hex": "87a4636f6465aa7474735f6661696c6564af636f6e766572736174696f6e5f696401a5666174616cc3a76d657373616765af7361666520646961676e6f73746963ab726573706f6e73655f696401a573636f7065a8726573706f6e7365a474797065a56572726f72"
+    }
+  ],
+  "protocol": "lumivox.voice.v1"
+}
