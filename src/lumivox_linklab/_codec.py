@@ -453,6 +453,272 @@ def _decode_error(message: dict[str, Primitive]) -> ErrorEvent:
     )
 
 
+def _audio_format_primitive(audio_format: AudioFormat) -> dict[str, Primitive]:
+    return {
+        "encoding": audio_format.encoding,
+        "sample_rate_hz": audio_format.sample_rate_hz,
+        "channels": audio_format.channels,
+    }
+
+
+def _connection_limits_primitive(limits: ConnectionLimits) -> dict[str, Primitive]:
+    return {
+        "max_message_bytes": limits.max_message_bytes,
+        "max_input_audio_frames": limits.max_input_audio_frames,
+        "max_output_audio_frames": limits.max_output_audio_frames,
+        "max_text_bytes": limits.max_text_bytes,
+        "max_input_frames": limits.max_input_frames,
+        "idle_timeout_ms": limits.idle_timeout_ms,
+    }
+
+
+def _message_to_primitive(message: Message) -> dict[str, Primitive]:
+    result: dict[str, Primitive]
+    if type(message) is ClientHello:
+        result = {
+            "type": message.type,
+            "version": message.version,
+            "capabilities": list(message.capabilities),
+            "input_format": _audio_format_primitive(message.input_format),
+            "output_formats": [_audio_format_primitive(value) for value in message.output_formats],
+        }
+        if message.agent is not None:
+            result["agent"] = message.agent
+    elif type(message) is ServerHello:
+        result = {
+            "type": message.type,
+            "version": message.version,
+            "capabilities": list(message.capabilities),
+            "output_format": _audio_format_primitive(message.output_format),
+            "limits": _connection_limits_primitive(message.limits),
+        }
+        if message.agent is not None:
+            result["agent"] = message.agent
+    elif type(message) is ConversationStartedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "activation": message.activation,
+        }
+        if message.wake_word is not None:
+            result["wake_word"] = message.wake_word
+    elif type(message) is InputStartedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "input_id": message.input_id,
+            "reason": message.reason.value,
+            "generation": message.generation,
+        }
+        if message.interrupts_response_id is not None:
+            result["interrupts_response_id"] = message.interrupts_response_id
+    elif type(message) is InputAudioEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "input_id": message.input_id,
+            "start_frame": message.start_frame,
+            "speech": message.speech,
+            "audio": message.audio,
+        }
+    elif type(message) is InputAbortedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "input_id": message.input_id,
+            "reason": message.reason.value,
+        }
+    elif type(message) is PlaybackFinishedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "output_id": message.output_id,
+            "played_frames": message.played_frames,
+        }
+    elif type(message) is PlaybackInterruptedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "output_id": message.output_id,
+            "played_frames": message.played_frames,
+            "position": message.position.value,
+            "reason": message.reason.value,
+        }
+    elif type(message) is ConversationCancelledEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "reason": message.reason.value,
+        }
+    elif type(message) is StateEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "revision": message.revision,
+            "state": message.state.value,
+        }
+        if message.reason is not None:
+            result["reason"] = message.reason
+    elif type(message) is InputClosedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "input_id": message.input_id,
+            "accepted_end_frame": message.accepted_end_frame,
+            "reason": message.reason.value,
+        }
+    elif type(message) is TranscriptUpdateEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "input_id": message.input_id,
+            "revision": message.revision,
+            "text": message.text,
+        }
+        if message.language is not None:
+            result["language"] = message.language
+    elif type(message) is TranscriptFinalEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "input_id": message.input_id,
+            "text": message.text,
+        }
+        if message.language is not None:
+            result["language"] = message.language
+    elif type(message) is ResponseStartedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "input_id": message.input_id,
+            "end_conversation": message.end_conversation,
+        }
+    elif type(message) is ResponseTextDeltaEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "sequence": message.sequence,
+            "text": message.text,
+        }
+    elif type(message) is ResponseTextFinalEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "text": message.text,
+        }
+    elif type(message) is OutputStartedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "output_id": message.output_id,
+        }
+    elif type(message) is OutputAudioEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "output_id": message.output_id,
+            "start_frame": message.start_frame,
+            "audio": message.audio,
+        }
+    elif type(message) is OutputEndedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "output_id": message.output_id,
+            "total_frames": message.total_frames,
+        }
+    elif type(message) is ResponseEndedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+        }
+    elif type(message) is ResponseCancelledEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "response_id": message.response_id,
+            "reason": message.reason.value,
+        }
+    elif type(message) is ConversationEndedEvent:
+        result = {
+            "type": message.type,
+            "conversation_id": message.conversation_id,
+            "reason": message.reason.value,
+        }
+    elif type(message) is ErrorEvent:
+        result = {
+            "type": message.type,
+            "scope": message.scope.value,
+            "code": message.code.value,
+            "fatal": message.fatal,
+        }
+        if message.conversation_id is not None:
+            result["conversation_id"] = message.conversation_id
+        if message.input_id is not None:
+            result["input_id"] = message.input_id
+        if message.response_id is not None:
+            result["response_id"] = message.response_id
+        if message.message is not None:
+            result["message"] = message.message
+    else:
+        raise CodecError("message must be a wire Message value")
+    return result
+
+
+def _canonicalize(value: Primitive) -> Primitive:
+    if type(value) is dict:
+        return {
+            key: _canonicalize(child) for key, child in sorted(value.items(), key=lambda item: item[0].encode("utf-8"))
+        }
+    if type(value) is list:
+        return [_canonicalize(child) for child in value]
+    return value
+
+
+def _pack_message(message: Message) -> bytes:
+    try:
+        primitive = _canonicalize(_message_to_primitive(message))
+        return cast(bytes, msgpack.packb(primitive, use_bin_type=True, strict_types=True))
+    except CodecError:
+        raise
+    except (AttributeError, TypeError, ValueError, OverflowError) as error:
+        raise CodecError("message does not satisfy its schema") from error
+
+
+def _enforce_encoded_size(encoded: bytes, message: Message, max_message_bytes: int) -> None:
+    effective_limit = min(max_message_bytes, _MAX_MESSAGE_BYTES)
+    if isinstance(message, ClientHello | ServerHello):
+        effective_limit = min(effective_limit, _MAX_FIRST_MESSAGE_BYTES)
+    if len(encoded) > effective_limit:
+        raise CodecError(f"encoded message exceeds the {effective_limit}-byte envelope")
+
+
+def encode_message(message: Message) -> bytes:
+    """Schema-validate and canonically encode one message with absolute limits."""
+    encoded = _pack_message(message)
+    _enforce_encoded_size(encoded, message, _MAX_MESSAGE_BYTES)
+    return encoded
+
+
+def _encode_message_with_limits(message: Message, limits: ConnectionLimits) -> bytes:
+    """Encode one message while enforcing limits selected for a connection."""
+    if not isinstance(limits, ConnectionLimits):
+        raise TypeError("limits must be ConnectionLimits")
+    _enforce_operational_limits(message, limits)
+    encoded = _pack_message(message)
+    _enforce_encoded_size(encoded, message, limits.max_message_bytes)
+    return encoded
+
+
 def _enforce_operational_limits(message: Message, limits: ConnectionLimits) -> None:
     if isinstance(message, InputAudioEvent) and len(message.audio) // 2 > limits.max_input_audio_frames:
         raise CodecError("input audio exceeds the negotiated frame limit")
