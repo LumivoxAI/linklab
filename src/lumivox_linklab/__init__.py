@@ -58,6 +58,7 @@ from ._messages import (
     PlaybackInterruptedEvent,
     ConversationCancelledEvent,
 )
+from ._protocol import ProtocolValidator
 
 __all__ = [
     "AnnotatedAudio",
@@ -106,6 +107,7 @@ __all__ = [
     "ProtocolObjectKind",
     "ProtocolStateSnapshot",
     "ProtocolTombstone",
+    "ProtocolValidator",
     "ProtocolViolation",
     "QueueOverflow",
     "ReadableBuffer",
