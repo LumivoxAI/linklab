@@ -5,18 +5,27 @@ from dataclasses import replace, dataclass
 from ._enums import (
     ErrorCode,
     ErrorScope,
+    CoarseState,
     EndpointRole,
     ConnectionState,
+    InputCloseReason,
+    InputStartReason,
     ProtocolObjectKind,
 )
 from ._errors import ProtocolViolation
-from ._values import ConversationId, ProtocolTombstone, ProtocolStateSnapshot
+from ._values import InputId, ConversationId, ProtocolTombstone, ProtocolStateSnapshot
 from ._messages import (
     Message,
     ErrorEvent,
     StateEvent,
     ClientHello,
     ServerHello,
+    InputAudioEvent,
+    InputClosedEvent,
+    InputAbortedEvent,
+    InputStartedEvent,
+    TranscriptFinalEvent,
+    TranscriptUpdateEvent,
     ConversationEndedEvent,
     ConversationStartedEvent,
     ConversationCancelledEvent,
@@ -59,6 +68,24 @@ class _Conversation:
     cancel: ConversationCancelledEvent | None = None
     failure: ErrorEvent | None = None
     state: StateEvent | None = None
+    input_id: InputId | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CancelledInput:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _Input:
+    start: InputStartedEvent
+    received_end_frame: int = 0
+    received_boundaries: tuple[int, ...] = ()
+    committed_end_frame: int = 0
+    terminal: InputClosedEvent | InputAbortedEvent | _CancelledInput | None = None
+    transcript_update: TranscriptUpdateEvent | None = None
+    transcript_final: TranscriptFinalEvent | None = None
+    failure: ErrorEvent | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +95,8 @@ class _ValidatorData:
     server_hello: ServerHello | None = None
     conversation: _Conversation | None = None
     conversation_ids: _IdAllocator = _IdAllocator()
+    input_ids: _IdAllocator = _IdAllocator()
+    inputs: tuple[_Input, ...] = ()
     tombstones: tuple[ProtocolTombstone, ...] = ()
     ended_conversations: tuple[ConversationEndedEvent, ...] = ()
     cancelled_conversations: tuple[ConversationCancelledEvent, ...] = ()
@@ -100,6 +129,47 @@ class ProtocolValidator:
         data, _ = self._transition(self._data, message)
         self._data = data
 
+    def _commit_input_audio(self, input_id: InputId, end_frame: int) -> tuple[Message, ...]:
+        """Record PCM delivery to the server application callback."""
+        if type(end_frame) is not int or end_frame < 0:
+            raise ProtocolViolation("committed input boundary must be a nonnegative integer")
+        input_ = self._find_input(self._data, input_id)
+        if input_ is None:
+            raise ProtocolViolation("committed input boundary targets no known input")
+        if input_.terminal is not None:
+            raise ProtocolViolation("terminal input boundary is immutable")
+        if not input_.committed_end_frame <= end_frame <= input_.received_end_frame:
+            raise ProtocolViolation("committed input boundary must be monotonic and already received")
+        if end_frame != 0 and end_frame not in input_.received_boundaries:
+            raise ProtocolViolation("committed input boundary must end a received audio chunk")
+        input_ = replace(input_, committed_end_frame=end_frame)
+        self._data = self._replace_input(self._data, input_)
+        limits = self._data.server_hello.limits if self._data.server_hello is not None else None
+        if limits is None or end_frame != limits.max_input_frames:
+            return ()
+        close = InputClosedEvent(
+            input_.start.conversation_id,
+            input_.start.input_id,
+            end_frame,
+            InputCloseReason.MAX_DURATION,
+        )
+        self._data = self._terminalize_input(self._data, input_, close)
+        return (close,)
+
+    def _response_input_ready(self, input_id: InputId) -> bool:
+        input_ = self._find_input(self._data, input_id)
+        conversation = self._data.conversation
+        return (
+            input_ is not None
+            and conversation is not None
+            and conversation.conversation_id == input_.start.conversation_id
+            and conversation.input_id == input_id
+            and conversation.cancel is None
+            and conversation.failure is None
+            and input_.terminal is not None
+            and input_.transcript_final is not None
+        )
+
     @property
     def state(self) -> ProtocolStateSnapshot:
         conversation = self._data.conversation
@@ -107,7 +177,7 @@ class ProtocolValidator:
         return ProtocolStateSnapshot(
             connection_state=self._data.connection_state,
             conversation_id=conversation.conversation_id if conversation is not None else None,
-            input_id=None,
+            input_id=conversation.input_id if conversation is not None else None,
             response_id=None,
             output_id=None,
             coarse_state=state.state if state is not None else None,
@@ -126,6 +196,18 @@ class ProtocolValidator:
 
         if isinstance(message, ConversationStartedEvent):
             return self._start_conversation(data, message)
+        if isinstance(message, InputStartedEvent):
+            return self._start_input(data, message)
+        if isinstance(message, InputAudioEvent):
+            return self._accept_input_audio(data, message)
+        if isinstance(message, InputAbortedEvent):
+            return self._abort_input(data, message)
+        if isinstance(message, InputClosedEvent):
+            return self._close_input(data, message)
+        if isinstance(message, TranscriptUpdateEvent):
+            return self._accept_transcript_update(data, message)
+        if isinstance(message, TranscriptFinalEvent):
+            return self._accept_transcript_final(data, message)
         if isinstance(message, ConversationCancelledEvent):
             return self._cancel_conversation(data, message)
         if isinstance(message, ConversationEndedEvent):
@@ -169,6 +251,154 @@ class ProtocolValidator:
         conversation = _Conversation(message.conversation_id)
         return replace(data, conversation=conversation, conversation_ids=allocator), self._result(message)
 
+    def _start_input(
+        self, data: _ValidatorData, message: InputStartedEvent
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        conversation = self._require_conversation(data, message.conversation_id)
+        if conversation.cancel is not None or conversation.failure is not None:
+            raise ProtocolViolation("terminal conversation cannot start an input")
+        if conversation.input_id is not None:
+            raise ProtocolViolation("conversation already has a current input")
+        has_conversation_input = any(item.start.conversation_id == message.conversation_id for item in data.inputs)
+        if not has_conversation_input and message.reason is not InputStartReason.ACTIVATION:
+            raise ProtocolViolation("the first input must start from activation")
+        if has_conversation_input and message.reason is InputStartReason.ACTIVATION:
+            raise ProtocolViolation("activation is only valid for the first input")
+        if message.reason is InputStartReason.BARGE_IN:
+            raise ProtocolViolation("barge-in requires a current response")
+        allocator = data.input_ids.observe(message.input_id)
+        input_ = _Input(message)
+        updated = replace(
+            data,
+            input_ids=allocator,
+            inputs=(*data.inputs, input_),
+            conversation=replace(conversation, input_id=message.input_id),
+        )
+        return updated, self._result(message)
+
+    def _accept_input_audio(
+        self, data: _ValidatorData, message: InputAudioEvent
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        input_ = self._require_input(data, message.input_id, message.conversation_id)
+        if self._role is EndpointRole.CLIENT and input_.failure is not None:
+            raise ProtocolViolation("failed input cannot send more audio")
+        frame_count = len(message.audio) // 2
+        if message.start_frame != input_.received_end_frame:
+            raise ProtocolViolation("input audio must be exactly contiguous")
+        end_frame = message.start_frame + frame_count
+
+        limits = data.server_hello.limits if data.server_hello is not None else None
+        if limits is None:
+            raise ProtocolViolation("input audio requires negotiated limits")
+        if frame_count > limits.max_input_audio_frames:
+            raise ProtocolViolation("input audio exceeds the negotiated message limit")
+        if input_.terminal is not None and end_frame > limits.max_input_frames:
+            raise ProtocolViolation("late input audio exceeds the negotiated aggregate limit")
+
+        if input_.terminal is not None:
+            if not isinstance(input_.terminal, InputClosedEvent):
+                raise ProtocolViolation("audio is not legal after input abort")
+            updated_input = replace(
+                input_,
+                received_end_frame=end_frame,
+                received_boundaries=(*input_.received_boundaries, end_frame),
+            )
+            return self._replace_input(data, updated_input), self._result(message, dispatch=False)
+
+        if end_frame > limits.max_input_frames:
+            if self._role is EndpointRole.CLIENT:
+                raise ProtocolViolation("input audio exceeds the negotiated aggregate limit")
+            error = ErrorEvent(
+                ErrorScope.INPUT,
+                ErrorCode.INPUT_TOO_LONG,
+                True,
+                message.conversation_id,
+                message.input_id,
+            )
+            return self._fail_input(data, input_, error, source=message)
+
+        updated_input = replace(
+            input_,
+            received_end_frame=end_frame,
+            received_boundaries=(*input_.received_boundaries, end_frame),
+        )
+        return self._replace_input(data, updated_input), self._result(message)
+
+    def _abort_input(
+        self, data: _ValidatorData, message: InputAbortedEvent
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        input_ = self._require_input(data, message.input_id, message.conversation_id)
+        if self._role is EndpointRole.CLIENT and input_.failure is not None:
+            raise ProtocolViolation("failed input cannot be aborted")
+        if input_.terminal is not None:
+            if input_.terminal == message:
+                return data, self._result(message, dispatch=False, terminal=True)
+            raise ProtocolViolation("conflicting input terminal event")
+        self._require_conversation(data, message.conversation_id)
+        return self._terminalize_input(data, input_, message), self._result(message, terminal=True)
+
+    def _close_input(self, data: _ValidatorData, message: InputClosedEvent) -> tuple[_ValidatorData, _TransitionResult]:
+        input_ = self._require_input(data, message.input_id, message.conversation_id)
+        if input_.terminal is not None:
+            if input_.terminal == message:
+                return data, self._result(message, dispatch=False, terminal=True)
+            raise ProtocolViolation("conflicting input terminal event")
+        self._require_conversation(data, message.conversation_id)
+        if message.accepted_end_frame > input_.received_end_frame:
+            raise ProtocolViolation("input close cannot accept frames that were not received")
+        if message.accepted_end_frame != 0 and message.accepted_end_frame not in input_.received_boundaries:
+            raise ProtocolViolation("input close boundary must end a received audio chunk")
+        if self._role is EndpointRole.SERVER and message.accepted_end_frame != input_.committed_end_frame:
+            raise ProtocolViolation("input close must use the callback-committed boundary")
+        if message.reason is not InputCloseReason.FAILED and input_.failure is not None:
+            raise ProtocolViolation("failed input must close as failed")
+        input_ = replace(input_, committed_end_frame=message.accepted_end_frame)
+        return self._terminalize_input(data, input_, message), self._result(message, terminal=True)
+
+    def _accept_transcript_update(
+        self, data: _ValidatorData, message: TranscriptUpdateEvent
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        self._require_live_conversation(data, message.conversation_id)
+        input_ = self._require_input(data, message.input_id, message.conversation_id)
+        if input_.terminal is not None or input_.failure is not None:
+            raise ProtocolViolation("transcript updates are legal only while input is open")
+        previous = input_.transcript_update
+        if previous is None:
+            if message.revision != 1:
+                raise ProtocolViolation("first transcript revision must be 1")
+        else:
+            if message == previous:
+                return data, self._result(message, dispatch=False)
+            if message.revision != previous.revision + 1:
+                raise ProtocolViolation("transcript revision must increment exactly by one")
+        updated = self._replace_input(data, replace(input_, transcript_update=message))
+        return updated, self._result(message)
+
+    def _accept_transcript_final(
+        self, data: _ValidatorData, message: TranscriptFinalEvent
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        self._require_live_conversation(data, message.conversation_id)
+        input_ = self._require_input(data, message.input_id, message.conversation_id)
+        if input_.transcript_final is not None:
+            if input_.transcript_final == message:
+                return data, self._result(message, dispatch=False)
+            raise ProtocolViolation("conflicting final transcript")
+        terminal = input_.terminal
+        if terminal is None:
+            raise ProtocolViolation("final transcript requires a terminal input")
+        empty_allowed = (
+            input_.failure is not None
+            or isinstance(terminal, InputAbortedEvent)
+            or (
+                isinstance(terminal, InputClosedEvent)
+                and terminal.reason in (InputCloseReason.NO_SPEECH, InputCloseReason.FAILED)
+            )
+        )
+        if not message.text and not empty_allowed:
+            raise ProtocolViolation("empty final transcript is not valid for this input terminal")
+        updated = self._replace_input(data, replace(input_, transcript_final=message))
+        return updated, self._result(message)
+
     def _cancel_conversation(
         self, data: _ValidatorData, message: ConversationCancelledEvent
     ) -> tuple[_ValidatorData, _TransitionResult]:
@@ -187,6 +417,9 @@ class ProtocolValidator:
             raise ProtocolViolation("conversation cancellation ID does not match the open conversation")
         if conversation.failure is not None:
             raise ProtocolViolation("failed conversation cannot be cancelled")
+        data = self._terminate_current_input(data, conversation)
+        conversation = data.conversation
+        assert conversation is not None
         updated = replace(conversation, cancel=message)
         cancelled = (*data.cancelled_conversations, message)
         return replace(data, conversation=updated, cancelled_conversations=cancelled), self._result(
@@ -209,6 +442,16 @@ class ProtocolValidator:
             raise ProtocolViolation("conversation end targets no open conversation")
         if message.conversation_id != conversation.conversation_id:
             raise ProtocolViolation("conversation end ID does not match the open conversation")
+        current_input = self._current_input(data, conversation)
+        if current_input is not None and current_input.terminal is None:
+            raise ProtocolViolation("conversation cannot end with an open input")
+        if (
+            current_input is not None
+            and conversation.cancel is None
+            and conversation.failure is None
+            and current_input.transcript_final is None
+        ):
+            raise ProtocolViolation("conversation cannot end before the final transcript")
         if conversation.cancel is not None and message.reason.value != "cancelled":
             raise ProtocolViolation("cancelled conversation must end as cancelled")
         if conversation.failure is not None:
@@ -263,7 +506,19 @@ class ProtocolValidator:
                 raise ProtocolViolation("state revision must increment exactly by one")
             if message.state is previous.state:
                 raise ProtocolViolation("state revision requires a coarse-state value change")
-        updated = replace(data, conversation=replace(conversation, state=message))
+        input_ = self._current_input(data, conversation)
+        if input_ is not None:
+            if input_.failure is not None:
+                if input_.terminal is None or input_.transcript_final is None:
+                    raise ProtocolViolation("failed input terminal sequence must complete before state changes")
+                if message.state not in (CoarseState.PROCESSING, CoarseState.WAITING):
+                    raise ProtocolViolation("failed input requires processing or waiting state")
+            else:
+                expected = CoarseState.LISTENING if input_.terminal is None else CoarseState.PROCESSING
+                if message.state is not expected:
+                    raise ProtocolViolation(f"current input requires {expected.value} state")
+        input_id = None if input_ is not None and message.state is CoarseState.WAITING else conversation.input_id
+        updated = replace(data, conversation=replace(conversation, state=message, input_id=input_id))
         return updated, self._result(message)
 
     def _accept_error(self, data: _ValidatorData, message: ErrorEvent) -> tuple[_ValidatorData, _TransitionResult]:
@@ -275,12 +530,31 @@ class ProtocolValidator:
                 terminal=True,
             )
         if message.scope is not ErrorScope.CONVERSATION:
-            raise ProtocolViolation("input and response errors are not implemented by this validator stage")
+            if message.scope is ErrorScope.INPUT:
+                conversation_id = message.conversation_id
+                input_id = message.input_id
+                assert conversation_id is not None and input_id is not None
+                self._require_live_conversation(data, conversation_id)
+                input_ = self._require_input(data, input_id, conversation_id)
+                if self._role is EndpointRole.CLIENT:
+                    if input_.failure is not None:
+                        raise ProtocolViolation("input already has a fatal error")
+                    updated = self._replace_input(data, replace(input_, failure=message))
+                    return updated, self._result(
+                        message,
+                        cancellation_targets=(ProtocolObjectKind.INPUT,),
+                        terminal=True,
+                    )
+                return self._fail_input(data, input_, message)
+            raise ProtocolViolation("response errors are not implemented by this validator stage")
         conversation = data.conversation
         if conversation is None or message.conversation_id != conversation.conversation_id:
             raise ProtocolViolation("conversation error targets no open conversation")
         if conversation.cancel is not None or conversation.failure is not None:
             raise ProtocolViolation("conversation is already terminal")
+        data = self._terminate_current_input(data, conversation)
+        conversation = data.conversation
+        assert conversation is not None
         updated = replace(data, conversation=replace(conversation, failure=message))
         return updated, self._result(
             message,
@@ -297,13 +571,129 @@ class ProtocolValidator:
         terminal: bool = False,
     ) -> _TransitionResult:
         if dispatch is None:
-            from_client = isinstance(message, (ClientHello, ConversationStartedEvent, ConversationCancelledEvent))
+            from_client = isinstance(
+                message,
+                (
+                    ClientHello,
+                    ConversationStartedEvent,
+                    InputStartedEvent,
+                    InputAudioEvent,
+                    InputAbortedEvent,
+                    ConversationCancelledEvent,
+                ),
+            )
             dispatch = from_client is (self._role is EndpointRole.SERVER)
         return _TransitionResult(
             dispatch=dispatch,
             cancellation_targets=cancellation_targets,
             terminal=terminal,
         )
+
+    def _fail_input(
+        self,
+        data: _ValidatorData,
+        input_: _Input,
+        error: ErrorEvent,
+        *,
+        source: Message | None = None,
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        if input_.failure is not None:
+            raise ProtocolViolation("input already has a fatal error")
+        terminal = input_.terminal
+        outbound: list[Message] = []
+        if terminal is None:
+            terminal = InputClosedEvent(
+                input_.start.conversation_id,
+                input_.start.input_id,
+                input_.committed_end_frame,
+                InputCloseReason.FAILED,
+            )
+            outbound.append(terminal)
+            data = self._terminalize_input(data, input_, terminal)
+            input_ = self._require_input(data, input_.start.input_id, input_.start.conversation_id)
+        final = input_.transcript_final
+        if final is None:
+            final = TranscriptFinalEvent(input_.start.conversation_id, input_.start.input_id, "")
+            outbound.append(final)
+        updated_input = replace(input_, failure=error, transcript_final=final)
+        updated = self._replace_input(data, updated_input)
+        return updated, _TransitionResult(
+            dispatch=False if source is not None else self._result(error).dispatch,
+            outbound=tuple((error, *outbound)) if source is not None else tuple(outbound),
+            cancellation_targets=(ProtocolObjectKind.INPUT,),
+            terminal=True,
+        )
+
+    def _terminalize_input(
+        self, data: _ValidatorData, input_: _Input, terminal: InputClosedEvent | InputAbortedEvent
+    ) -> _ValidatorData:
+        terminal_state = "closed" if isinstance(terminal, InputClosedEvent) else "aborted"
+        tombstone = ProtocolTombstone(
+            ProtocolObjectKind.INPUT,
+            input_.start.conversation_id,
+            input_.start.input_id,
+            None,
+            None,
+            terminal_state,
+        )
+        return self._replace_input(
+            replace(data, tombstones=(*data.tombstones, tombstone)),
+            replace(input_, terminal=terminal),
+        )
+
+    def _terminate_current_input(self, data: _ValidatorData, conversation: _Conversation) -> _ValidatorData:
+        input_ = self._current_input(data, conversation)
+        if input_ is None or input_.terminal is not None:
+            return data
+        tombstone = ProtocolTombstone(
+            ProtocolObjectKind.INPUT,
+            conversation.conversation_id,
+            input_.start.input_id,
+            None,
+            None,
+            "aborted",
+        )
+        return self._replace_input(
+            replace(data, tombstones=(*data.tombstones, tombstone)),
+            replace(input_, terminal=_CancelledInput()),
+        )
+
+    @staticmethod
+    def _require_conversation(data: _ValidatorData, conversation_id: ConversationId) -> _Conversation:
+        conversation = data.conversation
+        if conversation is None or conversation.conversation_id != conversation_id:
+            raise ProtocolViolation("message targets no open conversation")
+        return conversation
+
+    @classmethod
+    def _require_live_conversation(cls, data: _ValidatorData, conversation_id: ConversationId) -> _Conversation:
+        conversation = cls._require_conversation(data, conversation_id)
+        if conversation.cancel is not None or conversation.failure is not None:
+            raise ProtocolViolation("terminal conversation cannot accept child events")
+        return conversation
+
+    @staticmethod
+    def _find_input(data: _ValidatorData, input_id: InputId) -> _Input | None:
+        for input_ in reversed(data.inputs):
+            if input_.start.input_id == input_id:
+                return input_
+        return None
+
+    def _require_input(self, data: _ValidatorData, input_id: InputId, conversation_id: ConversationId) -> _Input:
+        input_ = self._find_input(data, input_id)
+        if input_ is None or input_.start.conversation_id != conversation_id:
+            raise ProtocolViolation("message targets no known input in this conversation")
+        return input_
+
+    def _current_input(self, data: _ValidatorData, conversation: _Conversation) -> _Input | None:
+        if conversation.input_id is None:
+            return None
+        return self._find_input(data, conversation.input_id)
+
+    @staticmethod
+    def _replace_input(data: _ValidatorData, updated: _Input) -> _ValidatorData:
+        inputs = tuple(updated if item.start.input_id == updated.start.input_id else item for item in data.inputs)
+        return replace(data, inputs=inputs)
 
     @staticmethod
     def _find_by_id[T: ConversationCancelledEvent | ConversationEndedEvent | StateEvent](
