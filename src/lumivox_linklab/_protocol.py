@@ -13,6 +13,7 @@ from ._enums import (
     ProtocolObjectKind,
     ResponseCancelReason,
     ConversationEndReason,
+    PlaybackInterruptReason,
 )
 from ._errors import ProtocolViolation
 from ._values import InputId, OutputId, ResponseId, ConversationId, ProtocolTombstone, ProtocolStateSnapshot
@@ -32,12 +33,14 @@ from ._messages import (
     ResponseEndedEvent,
     ResponseStartedEvent,
     TranscriptFinalEvent,
+    PlaybackFinishedEvent,
     TranscriptUpdateEvent,
     ConversationEndedEvent,
     ResponseCancelledEvent,
     ResponseTextDeltaEvent,
     ResponseTextFinalEvent,
     ConversationStartedEvent,
+    PlaybackInterruptedEvent,
     ConversationCancelledEvent,
 )
 
@@ -49,6 +52,7 @@ class _TransitionResult:
     dispatch: bool
     outbound: tuple[Message, ...] = ()
     cancellation_targets: tuple[ProtocolObjectKind, ...] = ()
+    error_code: ErrorCode | None = None
     terminal: bool = False
 
 
@@ -123,6 +127,8 @@ class _Response:
     output: _Output | None = None
     end: ResponseEndedEvent | None = None
     terminal: ResponseEndedEvent | ResponseCancelledEvent | None = None
+    playback: PlaybackFinishedEvent | PlaybackInterruptedEvent | None = None
+    stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +271,8 @@ class ProtocolValidator:
             return self._end_response(data, message)
         if isinstance(message, ResponseCancelledEvent):
             return self._cancel_response(data, message)
+        if isinstance(message, (PlaybackFinishedEvent, PlaybackInterruptedEvent)):
+            return self._accept_playback_outcome(data, message)
         if isinstance(message, ConversationCancelledEvent):
             return self._cancel_conversation(data, message)
         if isinstance(message, ConversationEndedEvent):
@@ -316,17 +324,41 @@ class ProtocolValidator:
             raise ProtocolViolation("terminal conversation cannot start an input")
         if conversation.expected_end_reason is not None:
             raise ProtocolViolation("conversation is awaiting its terminal end")
-        if conversation.response_id is not None:
+        generated_cancel: ResponseCancelledEvent | None = None
+        if message.reason is InputStartReason.BARGE_IN:
+            assert message.interrupts_response_id is not None
+            response = self._require_response(data, message.interrupts_response_id, message.conversation_id)
+            is_current = conversation.response_id == message.interrupts_response_id
+            is_pending_playback_barge = (
+                isinstance(response.terminal, ResponseCancelledEvent)
+                and response.terminal.reason is ResponseCancelReason.BARGE_IN
+                and isinstance(response.playback, PlaybackInterruptedEvent)
+                and response.playback.reason is PlaybackInterruptReason.BARGE_IN
+                and not any(item.start.input_id > response.start.input_id for item in data.inputs)
+            )
+            if not is_current and not is_pending_playback_barge:
+                raise ProtocolViolation("barge-in must reference the current response")
+            if any(item.start.interrupts_response_id == message.interrupts_response_id for item in data.inputs):
+                raise ProtocolViolation("response already has a barge-in input")
+            if conversation.input_id not in (None, response.start.input_id):
+                raise ProtocolViolation("conversation already has a current input")
+            if response.terminal is None or isinstance(response.terminal, ResponseEndedEvent):
+                generated_cancel = ResponseCancelledEvent(
+                    message.conversation_id,
+                    message.interrupts_response_id,
+                    ResponseCancelReason.BARGE_IN,
+                )
+                data, _ = self._cancel_response(data, generated_cancel)
+                conversation = self._require_conversation(data, message.conversation_id)
+        elif conversation.response_id is not None:
             raise ProtocolViolation("conversation already has a current response")
-        if conversation.input_id is not None:
+        if conversation.input_id is not None and message.reason is not InputStartReason.BARGE_IN:
             raise ProtocolViolation("conversation already has a current input")
         has_conversation_input = any(item.start.conversation_id == message.conversation_id for item in data.inputs)
         if not has_conversation_input and message.reason is not InputStartReason.ACTIVATION:
             raise ProtocolViolation("the first input must start from activation")
         if has_conversation_input and message.reason is InputStartReason.ACTIVATION:
             raise ProtocolViolation("activation is only valid for the first input")
-        if message.reason is InputStartReason.BARGE_IN:
-            raise ProtocolViolation("barge-in requires a current response")
         allocator = data.input_ids.observe(message.input_id)
         input_ = _Input(message)
         updated = replace(
@@ -335,7 +367,14 @@ class ProtocolValidator:
             inputs=(*data.inputs, input_),
             conversation=replace(conversation, input_id=message.input_id),
         )
-        return updated, self._result(message)
+        result = self._result(message)
+        if generated_cancel is not None:
+            result = replace(
+                result,
+                outbound=(generated_cancel,) if self._role is EndpointRole.SERVER else (),
+                cancellation_targets=(ProtocolObjectKind.RESPONSE,),
+            )
+        return updated, result
 
     def _accept_input_audio(
         self, data: _ValidatorData, message: InputAudioEvent
@@ -492,7 +531,7 @@ class ProtocolValidator:
         self, data: _ValidatorData, message: ResponseTextDeltaEvent
     ) -> tuple[_ValidatorData, _TransitionResult]:
         response = self._require_response(data, message.response_id, message.conversation_id)
-        stale = isinstance(response.terminal, ResponseCancelledEvent)
+        stale = response.stale or isinstance(response.terminal, ResponseCancelledEvent)
         if response.end is not None:
             raise ProtocolViolation("response text is not legal after response end")
         if response.terminal is not None and not stale:
@@ -512,7 +551,7 @@ class ProtocolValidator:
         self, data: _ValidatorData, message: ResponseTextFinalEvent
     ) -> tuple[_ValidatorData, _TransitionResult]:
         response = self._require_response(data, message.response_id, message.conversation_id)
-        stale = isinstance(response.terminal, ResponseCancelledEvent)
+        stale = response.stale or isinstance(response.terminal, ResponseCancelledEvent)
         if response.end is not None:
             raise ProtocolViolation("response text final is not legal after response end")
         if response.terminal is not None and not stale:
@@ -528,20 +567,35 @@ class ProtocolValidator:
         self, data: _ValidatorData, message: OutputStartedEvent
     ) -> tuple[_ValidatorData, _TransitionResult]:
         response = self._require_response(data, message.response_id, message.conversation_id)
-        if response.terminal is not None:
+        stale = response.stale or isinstance(response.terminal, ResponseCancelledEvent)
+        if response.terminal is not None and not stale:
             raise ProtocolViolation("output cannot start after response termination")
         if response.output is not None:
             raise ProtocolViolation("response may have at most one output")
         allocator = data.output_ids.observe(message.output_id)
-        output = _Output(message)
+        output = _Output(message, terminal=_CancelledOutput() if stale else None)
         conversation = self._require_conversation(data, message.conversation_id)
         updated_response = replace(response, output=output)
+        tombstones = data.tombstones
+        if stale:
+            tombstones = (
+                *tombstones,
+                ProtocolTombstone(
+                    ProtocolObjectKind.OUTPUT,
+                    message.conversation_id,
+                    None,
+                    message.response_id,
+                    message.output_id,
+                    "cancelled",
+                ),
+            )
         updated = replace(
             self._replace_response(data, updated_response),
             output_ids=allocator,
-            conversation=replace(conversation, output_id=message.output_id),
+            conversation=conversation if stale else replace(conversation, output_id=message.output_id),
+            tombstones=tombstones,
         )
-        return updated, self._result(message)
+        return updated, self._result(message, dispatch=not stale)
 
     def _accept_output_audio(
         self, data: _ValidatorData, message: OutputAudioEvent
@@ -552,7 +606,7 @@ class ProtocolValidator:
             message.output_id,
             message.conversation_id,
         )
-        stale = isinstance(response.terminal, ResponseCancelledEvent)
+        stale = response.stale or isinstance(response.terminal, ResponseCancelledEvent)
         if response.terminal is not None and not stale:
             raise ProtocolViolation("output audio is not legal after response end")
         if isinstance(output.terminal, OutputEndedEvent):
@@ -576,7 +630,7 @@ class ProtocolValidator:
             message.output_id,
             message.conversation_id,
         )
-        stale = isinstance(response.terminal, ResponseCancelledEvent)
+        stale = response.stale or isinstance(response.terminal, ResponseCancelledEvent)
         if response.terminal is not None and not stale:
             raise ProtocolViolation("output cannot end after response end")
         if isinstance(output.terminal, OutputEndedEvent):
@@ -613,6 +667,8 @@ class ProtocolValidator:
             if response.end == message:
                 return data, self._result(message, dispatch=False, terminal=True)
             raise ProtocolViolation("conflicting response terminal event")
+        if isinstance(response.terminal, ResponseCancelledEvent):
+            raise ProtocolViolation("cancelled response cannot end")
         if response.terminal is not None:
             raise ProtocolViolation("cancelled response cannot end")
         output = response.output
@@ -622,39 +678,76 @@ class ProtocolValidator:
         updated_response = replace(response, end=message, terminal=message)
         data = self._replace_response(data, updated_response)
         if output is not None:
+            if isinstance(response.playback, PlaybackFinishedEvent):
+                return self._complete_response(data, updated_response), self._result(message, terminal=True)
             return data, self._result(message, terminal=True)
+        return self._complete_response(data, updated_response), self._result(message, terminal=True)
 
-        conversation = self._require_conversation(data, message.conversation_id)
-        expected_end = ConversationEndReason.COMPLETED if response.start.end_conversation else None
-        tombstone = ProtocolTombstone(
-            ProtocolObjectKind.RESPONSE,
-            message.conversation_id,
-            None,
-            message.response_id,
-            None,
-            "completed",
-        )
-        updated = replace(
+    def _accept_playback_outcome(
+        self,
+        data: _ValidatorData,
+        message: PlaybackFinishedEvent | PlaybackInterruptedEvent,
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        response, output = self._require_output(
             data,
-            conversation=replace(
-                conversation,
-                input_id=None,
-                response_id=None,
-                expected_end_reason=expected_end,
-            ),
-            tombstones=(*data.tombstones, tombstone),
+            message.response_id,
+            message.output_id,
+            message.conversation_id,
         )
-        return updated, self._result(message, terminal=True)
+        if response.playback is not None:
+            if response.playback == message:
+                return data, self._result(message, dispatch=False, terminal=True)
+            raise ProtocolViolation("conflicting playback outcome")
+
+        if isinstance(message, PlaybackFinishedEvent):
+            if not isinstance(output.terminal, OutputEndedEvent):
+                raise ProtocolViolation("playback finished requires output end")
+            if message.played_frames != output.terminal.total_frames:
+                raise ProtocolViolation("finished playback frames must equal output total")
+            updated_response = replace(response, playback=message)
+            updated = self._replace_response(data, updated_response)
+            if response.end is not None and not isinstance(response.terminal, ResponseCancelledEvent):
+                updated = self._complete_response(updated, updated_response)
+            return updated, self._result(message, terminal=True)
+
+        if message.played_frames > output.received_end_frame:
+            raise ProtocolViolation("interrupted playback frames exceed sent output")
+        updated_response = replace(response, playback=message, stale=True)
+        updated = self._replace_response(data, updated_response)
+        if isinstance(response.terminal, ResponseCancelledEvent):
+            return updated, self._result(message, terminal=True)
+
+        if message.reason in (PlaybackInterruptReason.PLAYBACK_FAILED, PlaybackInterruptReason.OVERFLOW):
+            return updated, replace(
+                self._result(message, terminal=True),
+                cancellation_targets=(ProtocolObjectKind.RESPONSE,),
+                error_code=ErrorCode.PLAYBACK_FAILED,
+            )
+
+        cancel_reason = {
+            PlaybackInterruptReason.BARGE_IN: ResponseCancelReason.BARGE_IN,
+            PlaybackInterruptReason.LOCAL_CANCEL: ResponseCancelReason.LOCAL_CANCEL,
+            PlaybackInterruptReason.SHUTDOWN: ResponseCancelReason.SHUTDOWN,
+        }[message.reason]
+        cancel = ResponseCancelledEvent(message.conversation_id, message.response_id, cancel_reason)
+        updated, _ = self._cancel_response(updated, cancel)
+        return updated, replace(
+            self._result(message, terminal=True),
+            outbound=(cancel,) if self._role is EndpointRole.SERVER else (),
+            cancellation_targets=(ProtocolObjectKind.RESPONSE,),
+        )
 
     def _cancel_response(
         self, data: _ValidatorData, message: ResponseCancelledEvent
     ) -> tuple[_ValidatorData, _TransitionResult]:
         response = self._require_response(data, message.response_id, message.conversation_id)
-        conversation = self._require_conversation(data, message.conversation_id)
         if isinstance(response.terminal, ResponseCancelledEvent):
             if response.terminal == message:
                 return data, self._result(message, dispatch=False, terminal=True)
             raise ProtocolViolation("conflicting response cancellation")
+        conversation = self._require_conversation(data, message.conversation_id)
+        if conversation.response_id != message.response_id:
+            raise ProtocolViolation("completed response cannot be cancelled")
         if response.end is not None and response.output is None:
             raise ProtocolViolation("completed response cannot be cancelled")
         if conversation.cancel is not None and message.reason is not ResponseCancelReason.CONVERSATION_CANCELLED:
@@ -675,7 +768,7 @@ class ProtocolValidator:
                     "cancelled",
                 ),
             )
-        updated_response = replace(response, output=output, terminal=message)
+        updated_response = replace(response, output=output, terminal=message, stale=True)
         tombstones = (
             *tombstones,
             ProtocolTombstone(
@@ -688,11 +781,16 @@ class ProtocolValidator:
             ),
         )
         expected_end = self._response_cancellation_end_reason(response, message.reason)
+        keep_barge_input = (
+            message.reason is ResponseCancelReason.BARGE_IN
+            and conversation.input_id is not None
+            and conversation.input_id != response.start.input_id
+        )
         updated = replace(
             self._replace_response(data, updated_response),
             conversation=replace(
                 conversation,
-                input_id=None,
+                input_id=conversation.input_id if keep_barge_input else None,
                 response_id=None,
                 output_id=None,
                 expected_end_reason=expected_end,
@@ -700,6 +798,29 @@ class ProtocolValidator:
             tombstones=tombstones,
         )
         return updated, self._result(message, terminal=True)
+
+    def _complete_response(self, data: _ValidatorData, response: _Response) -> _ValidatorData:
+        conversation = self._require_conversation(data, response.start.conversation_id)
+        expected_end = ConversationEndReason.COMPLETED if response.start.end_conversation else None
+        tombstone = ProtocolTombstone(
+            ProtocolObjectKind.RESPONSE,
+            response.start.conversation_id,
+            None,
+            response.start.response_id,
+            None,
+            "completed",
+        )
+        return replace(
+            data,
+            conversation=replace(
+                conversation,
+                input_id=None,
+                response_id=None,
+                output_id=None,
+                expected_end_reason=expected_end,
+            ),
+            tombstones=(*data.tombstones, tombstone),
+        )
 
     def _cancel_conversation(
         self, data: _ValidatorData, message: ConversationCancelledEvent
@@ -891,6 +1012,8 @@ class ProtocolValidator:
                     InputStartedEvent,
                     InputAudioEvent,
                     InputAbortedEvent,
+                    PlaybackFinishedEvent,
+                    PlaybackInterruptedEvent,
                     ConversationCancelledEvent,
                 ),
             )
