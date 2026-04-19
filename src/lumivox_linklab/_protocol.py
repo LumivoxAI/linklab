@@ -53,6 +53,7 @@ class _TransitionResult:
     outbound: tuple[Message, ...] = ()
     cancellation_targets: tuple[ProtocolObjectKind, ...] = ()
     error_code: ErrorCode | None = None
+    close_code: int | None = None
     terminal: bool = False
 
 
@@ -128,6 +129,7 @@ class _Response:
     end: ResponseEndedEvent | None = None
     terminal: ResponseEndedEvent | ResponseCancelledEvent | None = None
     playback: PlaybackFinishedEvent | PlaybackInterruptedEvent | None = None
+    failure: ErrorEvent | None = None
     stale: bool = False
 
 
@@ -303,7 +305,7 @@ class ProtocolValidator:
             if data.client_hello is None or data.server_hello is not None:
                 raise ProtocolViolation("handshake error must replace server hello")
             closing = replace(data, connection_state=ConnectionState.CLOSING)
-            return closing, self._result(message, terminal=True)
+            return closing, replace(self._result(message, terminal=True), close_code=1002)
 
         raise ProtocolViolation("only hello or a server connection error is legal during handshake")
 
@@ -450,6 +452,9 @@ class ProtocolValidator:
             raise ProtocolViolation("input close boundary must end a received audio chunk")
         if self._role is EndpointRole.SERVER and message.accepted_end_frame != input_.committed_end_frame:
             raise ProtocolViolation("input close must use the callback-committed boundary")
+        conversation = self._require_conversation(data, message.conversation_id)
+        if conversation.failure is not None and message.reason is not InputCloseReason.FAILED:
+            raise ProtocolViolation("conversation failure requires a failed input close")
         if message.reason is not InputCloseReason.FAILED and input_.failure is not None:
             raise ProtocolViolation("failed input must close as failed")
         input_ = replace(input_, committed_end_frame=message.accepted_end_frame)
@@ -477,7 +482,11 @@ class ProtocolValidator:
     def _accept_transcript_final(
         self, data: _ValidatorData, message: TranscriptFinalEvent
     ) -> tuple[_ValidatorData, _TransitionResult]:
-        self._require_live_conversation(data, message.conversation_id)
+        conversation = self._require_conversation(data, message.conversation_id)
+        if conversation.cancel is not None:
+            raise ProtocolViolation("terminal conversation cannot accept child events")
+        if conversation.failure is not None and message.text:
+            raise ProtocolViolation("conversation failure fallback transcript must be empty")
         input_ = self._require_input(data, message.input_id, message.conversation_id)
         if input_.transcript_final is not None:
             if input_.transcript_final == message:
@@ -487,7 +496,8 @@ class ProtocolValidator:
         if terminal is None:
             raise ProtocolViolation("final transcript requires a terminal input")
         empty_allowed = (
-            input_.failure is not None
+            conversation.failure is not None
+            or input_.failure is not None
             or isinstance(terminal, InputAbortedEvent)
             or (
                 isinstance(terminal, InputClosedEvent)
@@ -718,6 +728,15 @@ class ProtocolValidator:
             return updated, self._result(message, terminal=True)
 
         if message.reason in (PlaybackInterruptReason.PLAYBACK_FAILED, PlaybackInterruptReason.OVERFLOW):
+            if self._role is EndpointRole.SERVER:
+                error = ErrorEvent(
+                    ErrorScope.RESPONSE,
+                    ErrorCode.PLAYBACK_FAILED,
+                    True,
+                    message.conversation_id,
+                    response_id=message.response_id,
+                )
+                return self._fail_response(updated, updated_response, error, source=message)
             return updated, replace(
                 self._result(message, terminal=True),
                 cancellation_targets=(ProtocolObjectKind.RESPONSE,),
@@ -752,6 +771,12 @@ class ProtocolValidator:
             raise ProtocolViolation("completed response cannot be cancelled")
         if conversation.cancel is not None and message.reason is not ResponseCancelReason.CONVERSATION_CANCELLED:
             raise ProtocolViolation("conversation cancellation requires matching response cancellation")
+        if conversation.failure is not None and message.reason is not ResponseCancelReason.CONVERSATION_CANCELLED:
+            raise ProtocolViolation("conversation failure requires matching response cancellation")
+        if response.failure is not None:
+            expected_reason = self._response_error_cancel_reason(response.failure.code)
+            if message.reason is not expected_reason:
+                raise ProtocolViolation(f"response error requires cancellation reason {expected_reason.value}")
 
         tombstones = data.tombstones
         output = response.output
@@ -781,6 +806,8 @@ class ProtocolValidator:
             ),
         )
         expected_end = self._response_cancellation_end_reason(response, message.reason)
+        if conversation.failure is not None:
+            expected_end = self._conversation_failure_end_reason(conversation.failure.code)
         keep_barge_input = (
             message.reason is ResponseCancelReason.BARGE_IN
             and conversation.input_id is not None
@@ -880,9 +907,9 @@ class ProtocolValidator:
         if conversation.cancel is not None and message.reason.value != "cancelled":
             raise ProtocolViolation("cancelled conversation must end as cancelled")
         if conversation.failure is not None:
-            expected = "idle_timeout" if conversation.failure.code is ErrorCode.IDLE_TIMEOUT else "server_failed"
-            if message.reason.value != expected:
-                raise ProtocolViolation(f"failed conversation must end as {expected}")
+            expected = self._conversation_failure_end_reason(conversation.failure.code)
+            if message.reason is not expected:
+                raise ProtocolViolation(f"failed conversation must end as {expected.value}")
         if conversation.expected_end_reason is not None and message.reason is not conversation.expected_end_reason:
             raise ProtocolViolation(f"conversation must end as {conversation.expected_end_reason.value}")
 
@@ -957,38 +984,58 @@ class ProtocolValidator:
     def _accept_error(self, data: _ValidatorData, message: ErrorEvent) -> tuple[_ValidatorData, _TransitionResult]:
         if message.scope is ErrorScope.CONNECTION:
             closing = replace(data, connection_state=ConnectionState.CLOSING)
-            return closing, self._result(
+            targets = (ProtocolObjectKind.CONVERSATION,) if data.conversation is not None else ()
+            return closing, replace(
+                self._result(message, cancellation_targets=targets, terminal=True),
+                close_code=1002,
+            )
+        if message.scope is ErrorScope.INPUT:
+            conversation_id = message.conversation_id
+            input_id = message.input_id
+            assert conversation_id is not None and input_id is not None
+            conversation = self._require_live_conversation(data, conversation_id)
+            input_ = self._require_input(data, input_id, conversation_id)
+            if conversation.input_id != input_id or input_.response_id is not None:
+                raise ProtocolViolation("input error must target the current recoverable input")
+            if self._role is EndpointRole.CLIENT:
+                if input_.failure is not None:
+                    raise ProtocolViolation("input already has a fatal error")
+                updated = self._replace_input(data, replace(input_, failure=message))
+                return updated, self._result(
+                    message,
+                    cancellation_targets=(ProtocolObjectKind.INPUT,),
+                    terminal=True,
+                )
+            return self._fail_input(data, input_, message)
+        if message.scope is ErrorScope.RESPONSE:
+            conversation_id = message.conversation_id
+            response_id = message.response_id
+            assert conversation_id is not None and response_id is not None
+            conversation = self._require_live_conversation(data, conversation_id)
+            response = self._require_response(data, response_id, conversation_id)
+            if conversation.response_id != response_id or response.terminal is not None:
+                raise ProtocolViolation("response error must target the current live response")
+            if self._role is EndpointRole.SERVER:
+                return self._fail_response(data, response, message)
+            if response.failure is not None:
+                raise ProtocolViolation("response already has a fatal error")
+            updated = self._replace_response(data, replace(response, failure=message, stale=True))
+            return updated, self._result(
                 message,
-                cancellation_targets=(ProtocolObjectKind.CONVERSATION,),
+                cancellation_targets=(ProtocolObjectKind.RESPONSE,),
                 terminal=True,
             )
-        if message.scope is not ErrorScope.CONVERSATION:
-            if message.scope is ErrorScope.INPUT:
-                conversation_id = message.conversation_id
-                input_id = message.input_id
-                assert conversation_id is not None and input_id is not None
-                self._require_live_conversation(data, conversation_id)
-                input_ = self._require_input(data, input_id, conversation_id)
-                if self._role is EndpointRole.CLIENT:
-                    if input_.failure is not None:
-                        raise ProtocolViolation("input already has a fatal error")
-                    updated = self._replace_input(data, replace(input_, failure=message))
-                    return updated, self._result(
-                        message,
-                        cancellation_targets=(ProtocolObjectKind.INPUT,),
-                        terminal=True,
-                    )
-                return self._fail_input(data, input_, message)
-            raise ProtocolViolation("response errors are not implemented by this validator stage")
-        conversation = data.conversation
-        if conversation is None or message.conversation_id != conversation.conversation_id:
+        failed_conversation = data.conversation
+        if failed_conversation is None or message.conversation_id != failed_conversation.conversation_id:
             raise ProtocolViolation("conversation error targets no open conversation")
-        if conversation.cancel is not None or conversation.failure is not None:
+        if failed_conversation.cancel is not None or failed_conversation.failure is not None:
             raise ProtocolViolation("conversation is already terminal")
-        data = self._terminate_current_input(data, conversation)
-        conversation = data.conversation
-        assert conversation is not None
-        updated = replace(data, conversation=replace(conversation, failure=message))
+        if self._role is EndpointRole.SERVER:
+            return self._fail_conversation(data, failed_conversation, message)
+        active_response = self._current_response(data, failed_conversation)
+        if active_response is not None:
+            data = self._replace_response(data, replace(active_response, stale=True))
+        updated = replace(data, conversation=replace(failed_conversation, failure=message))
         return updated, self._result(
             message,
             cancellation_targets=(ProtocolObjectKind.CONVERSATION,),
@@ -1059,6 +1106,95 @@ class ProtocolValidator:
             terminal=True,
         )
 
+    def _fail_response(
+        self,
+        data: _ValidatorData,
+        response: _Response,
+        error: ErrorEvent,
+        *,
+        source: Message | None = None,
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        if response.failure is not None:
+            raise ProtocolViolation("response already has a fatal error")
+        if response.terminal is not None:
+            raise ProtocolViolation("terminal response cannot fail")
+
+        response = replace(response, failure=error, stale=True)
+        data = self._replace_response(data, response)
+        cancel = ResponseCancelledEvent(
+            response.start.conversation_id,
+            response.start.response_id,
+            self._response_error_cancel_reason(error.code),
+        )
+        data, _ = self._cancel_response(data, cancel)
+        outbound: list[Message] = [cancel]
+        conversation = self._require_conversation(data, response.start.conversation_id)
+        if conversation.expected_end_reason is not None:
+            end = ConversationEndedEvent(conversation.conversation_id, conversation.expected_end_reason)
+            data, _ = self._end_conversation(data, end)
+            outbound.append(end)
+        if source is not None:
+            outbound.insert(0, error)
+        return data, _TransitionResult(
+            dispatch=False if source is not None else self._result(error).dispatch,
+            outbound=tuple(outbound),
+            cancellation_targets=(ProtocolObjectKind.RESPONSE,),
+            error_code=error.code if source is not None else None,
+            terminal=True,
+        )
+
+    def _fail_conversation(
+        self,
+        data: _ValidatorData,
+        conversation: _Conversation,
+        error: ErrorEvent,
+    ) -> tuple[_ValidatorData, _TransitionResult]:
+        response = self._current_response(data, conversation)
+        if response is not None:
+            data = self._replace_response(data, replace(response, stale=True))
+        conversation = replace(conversation, failure=error)
+        data = replace(data, conversation=conversation)
+        outbound: list[Message] = []
+
+        input_ = self._current_input(data, conversation)
+        if input_ is not None:
+            if input_.terminal is None:
+                close = InputClosedEvent(
+                    conversation.conversation_id,
+                    input_.start.input_id,
+                    input_.committed_end_frame,
+                    InputCloseReason.FAILED,
+                )
+                data = self._terminalize_input(data, input_, close)
+                outbound.append(close)
+                input_ = self._require_input(data, input_.start.input_id, conversation.conversation_id)
+            if input_.transcript_final is None:
+                final = TranscriptFinalEvent(conversation.conversation_id, input_.start.input_id, "")
+                data = self._replace_input(data, replace(input_, transcript_final=final))
+                outbound.append(final)
+
+        if response is not None:
+            cancel = ResponseCancelledEvent(
+                conversation.conversation_id,
+                response.start.response_id,
+                ResponseCancelReason.CONVERSATION_CANCELLED,
+            )
+            data, _ = self._cancel_response(data, cancel)
+            outbound.append(cancel)
+
+        end = ConversationEndedEvent(
+            conversation.conversation_id,
+            self._conversation_failure_end_reason(error.code),
+        )
+        data, _ = self._end_conversation(data, end)
+        outbound.append(end)
+        return data, _TransitionResult(
+            dispatch=self._result(error).dispatch,
+            outbound=tuple(outbound),
+            cancellation_targets=(ProtocolObjectKind.CONVERSATION,),
+            terminal=True,
+        )
+
     def _terminalize_input(
         self, data: _ValidatorData, input_: _Input, terminal: InputClosedEvent | InputAbortedEvent
     ) -> _ValidatorData:
@@ -1114,6 +1250,22 @@ class ProtocolValidator:
         ):
             return ConversationEndReason.SERVER_FAILED
         return None
+
+    @staticmethod
+    def _response_error_cancel_reason(code: ErrorCode) -> ResponseCancelReason:
+        return {
+            ErrorCode.GENERATION_FAILED: ResponseCancelReason.GENERATION_FAILED,
+            ErrorCode.TTS_FAILED: ResponseCancelReason.TTS_FAILED,
+            ErrorCode.PLAYBACK_FAILED: ResponseCancelReason.PLAYBACK_FAILED,
+            ErrorCode.OUTPUT_OVERFLOW: ResponseCancelReason.OVERFLOW,
+            ErrorCode.RESPONSE_CANCELLED: ResponseCancelReason.CONVERSATION_CANCELLED,
+        }[code]
+
+    @staticmethod
+    def _conversation_failure_end_reason(code: ErrorCode) -> ConversationEndReason:
+        if code is ErrorCode.IDLE_TIMEOUT:
+            return ConversationEndReason.IDLE_TIMEOUT
+        return ConversationEndReason.SERVER_FAILED
 
     @staticmethod
     def _require_conversation(data: _ValidatorData, conversation_id: ConversationId) -> _Conversation:
