@@ -159,7 +159,25 @@ def test_playback_failures_are_stale_and_classified_for_error_plans(
     data, result = validator._transition(validator._data, interrupted(reason))
     assert result.error_code is linklab.ErrorCode.PLAYBACK_FAILED
     assert result.cancellation_targets == (linklab.ProtocolObjectKind.RESPONSE,)
-    assert result.outbound == ()
+    assert result.outbound == (
+        linklab.ErrorEvent(
+            linklab.ErrorScope.RESPONSE,
+            linklab.ErrorCode.PLAYBACK_FAILED,
+            True,
+            CONVERSATION_ID,
+            response_id=RESPONSE_ID,
+        ),
+        linklab.ResponseCancelledEvent(
+            CONVERSATION_ID,
+            RESPONSE_ID,
+            linklab.ResponseCancelReason.PLAYBACK_FAILED,
+        ),
+        linklab.ConversationEndedEvent(
+            CONVERSATION_ID,
+            linklab.ConversationEndReason.PLAYBACK_FAILED,
+        ),
+    )
+    assert data.conversation is None
     validator._data = data
 
     late_audio = linklab.OutputAudioEvent(CONVERSATION_ID, RESPONSE_ID, OUTPUT_ID, 4, b"\0\0")
