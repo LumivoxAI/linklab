@@ -64,6 +64,16 @@ class _StructuralError(Exception):
     pass
 
 
+class _OperationalLimitError(CodecError):
+    pass
+
+
+class _InboundMessageError(CodecError):
+    def __init__(self, code: ErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def _reject_extension(_code: int, _data: bytes) -> Never:
     raise _StructuralError("MessagePack extensions are not allowed")
 
@@ -721,9 +731,9 @@ def _encode_message_with_limits(message: Message, limits: ConnectionLimits) -> b
 
 def _enforce_operational_limits(message: Message, limits: ConnectionLimits) -> None:
     if isinstance(message, InputAudioEvent) and len(message.audio) // 2 > limits.max_input_audio_frames:
-        raise CodecError("input audio exceeds the negotiated frame limit")
+        raise _OperationalLimitError("input audio exceeds the negotiated frame limit")
     if isinstance(message, OutputAudioEvent) and len(message.audio) // 2 > limits.max_output_audio_frames:
-        raise CodecError("output audio exceeds the negotiated frame limit")
+        raise _OperationalLimitError("output audio exceeds the negotiated frame limit")
     if (
         isinstance(
             message,
@@ -731,7 +741,75 @@ def _enforce_operational_limits(message: Message, limits: ConnectionLimits) -> N
         )
         and len(message.text.encode("utf-8")) > limits.max_text_bytes
     ):
-        raise CodecError("text exceeds the negotiated byte limit")
+        raise _OperationalLimitError("text exceeds the negotiated byte limit")
+
+
+_CLIENT_MESSAGE_TYPES = frozenset(
+    {
+        "hello",
+        "conversation.start",
+        "input.start",
+        "input.audio",
+        "input.abort",
+        "playback.finished",
+        "playback.interrupted",
+        "conversation.cancel",
+    }
+)
+_SERVER_MESSAGE_TYPES = frozenset(
+    {
+        "hello",
+        "state",
+        "input.closed",
+        "transcript.update",
+        "transcript.final",
+        "response.start",
+        "response.text.delta",
+        "response.text.final",
+        "output.start",
+        "output.audio",
+        "output.end",
+        "response.end",
+        "response.cancelled",
+        "conversation.end",
+        "error",
+    }
+)
+
+
+def _decode_message_for_transport(
+    data: ReadableBuffer,
+    *,
+    direction: MessageDirection,
+    limits: ConnectionLimits,
+) -> Message:
+    """Decode a peer frame while retaining its stable connection-error category."""
+    try:
+        size = len(_as_bytes_view(data))
+    except CodecError as error:
+        raise _InboundMessageError(ErrorCode.MALFORMED_MESSAGE, str(error)) from error
+    if size > limits.max_message_bytes:
+        raise _InboundMessageError(ErrorCode.MESSAGE_TOO_LARGE, "message exceeds the negotiated envelope")
+
+    try:
+        primitive = _decode_primitive_message(data, max_message_bytes=limits.max_message_bytes)
+        message_type = _string(primitive, "type")
+    except CodecError as error:
+        raise _InboundMessageError(ErrorCode.MALFORMED_MESSAGE, str(error)) from error
+    assert message_type is not None
+
+    allowed = _CLIENT_MESSAGE_TYPES if direction is MessageDirection.CLIENT_TO_SERVER else _SERVER_MESSAGE_TYPES
+    all_known = _CLIENT_MESSAGE_TYPES | _SERVER_MESSAGE_TYPES
+    if message_type not in allowed:
+        code = ErrorCode.PROTOCOL_STATE if message_type in all_known else ErrorCode.UNKNOWN_MESSAGE
+        raise _InboundMessageError(code, f"message type is not valid in {direction.value}")
+
+    try:
+        return decode_message(data, direction=direction, limits=limits)
+    except _OperationalLimitError as error:
+        raise _InboundMessageError(ErrorCode.MESSAGE_TOO_LARGE, str(error)) from error
+    except CodecError as error:
+        raise _InboundMessageError(ErrorCode.MALFORMED_MESSAGE, str(error)) from error
 
 
 def decode_message(
