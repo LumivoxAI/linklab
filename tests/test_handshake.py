@@ -22,6 +22,7 @@ from lumivox_linklab._handshake import (
     _open_client_websocket,
     _perform_server_handshake,
 )
+from lumivox_linklab._transport import _TransportCore
 
 CAPABILITIES = ("barge_in", "playback_accounting", "speech_spans")
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
@@ -309,6 +310,79 @@ def test_client_accepts_connection_error_in_place_of_server_hello() -> None:
     run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ("text", linklab.ErrorCode.MALFORMED_MESSAGE),
+        (b"\xc1", linklab.ErrorCode.MALFORMED_MESSAGE),
+        (msgpack.packb({"type": "future.message"}, use_bin_type=True), linklab.ErrorCode.UNKNOWN_MESSAGE),
+        (
+            linklab.encode_message(linklab.ConversationStartedEvent(linklab.ConversationId(2), "wake_word")),
+            linklab.ErrorCode.PROTOCOL_STATE,
+        ),
+        (b"x" * 16_385, linklab.ErrorCode.MESSAGE_TOO_LARGE),
+    ],
+)
+def test_loopback_post_handshake_fatal_error_is_last_message(
+    payload: bytes | str,
+    expected: linklab.ErrorCode,
+) -> None:
+    async def scenario() -> None:
+        config = server_config(limits=linklab.ConnectionLimits(max_message_bytes=16_384, max_output_audio_frames=4_800))
+        cores: list[_TransportCore] = []
+
+        async def handler(connection: ServerConnection) -> None:
+            handshake = await _perform_server_handshake(connection, config)
+            assert handshake is not None
+            core = _TransportCore(
+                connection,
+                role=linklab.EndpointRole.SERVER,
+                limits=handshake.server_hello.limits,
+                data_capacity=8,
+                control_capacity=8,
+                close_timeout_s=config.close_timeout_s,
+                ping_interval_s=config.ping_interval_s,
+                ping_timeout_s=config.ping_timeout_s,
+                on_transition=lambda _message, _result: None,
+                on_transport_loss=lambda _error: None,
+            )
+            cores.append(core)
+            core.start_handshaken(handshake.client_hello, handshake.server_hello)
+            await core.wait_closed()
+
+        server = await _serve_websocket(config, handler)
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{config.port}",
+                subprotocols=[_SUBPROTOCOL],
+                compression=None,
+                ping_interval=None,
+                proxy=None,
+            ) as connection:
+                await connection.send(linklab.encode_message(linklab.ClientHello(1, CAPABILITIES, PCM_16K, (PCM_16K,))))
+                hello = await connection.recv()
+                assert type(hello) is bytes
+                await connection.send(payload)
+                reply = await connection.recv()
+                assert type(reply) is bytes
+                error = linklab.decode_message(
+                    reply,
+                    direction=linklab.MessageDirection.SERVER_TO_CLIENT,
+                    limits=linklab.ConnectionLimits(),
+                )
+                assert isinstance(error, linklab.ErrorEvent)
+                assert error.code is expected
+                await connection.wait_closed()
+                assert connection.close_code == 1002
+        finally:
+            await close_server(server)
+
+        assert cores and cores[0].outcome is not None
+        assert not cores[0].outcome.reconnect_eligible
+
+    run(scenario())
+
+
 def test_selected_limits_use_selected_rate_bounds() -> None:
     configured = linklab.ConnectionLimits(max_output_audio_frames=4_800)
     assert _selected_limits(configured, PCM_16K).max_output_audio_frames == 1_600
@@ -387,8 +461,8 @@ def test_websocket_options_and_ssl_context_are_wired_without_mutation(monkeypatc
                 "subprotocols": [_SUBPROTOCOL],
                 "compression": None,
                 "open_timeout": 3,
-                "ping_interval": 5,
-                "ping_timeout": 6,
+                "ping_interval": None,
+                "ping_timeout": None,
                 "close_timeout": 4,
                 "max_size": 262_144,
                 "max_queue": 7,
@@ -417,8 +491,8 @@ def test_websocket_options_and_ssl_context_are_wired_without_mutation(monkeypatc
         "select_subprotocol": server_calls[0][3]["select_subprotocol"],
         "compression": None,
         "open_timeout": 10.0,
-        "ping_interval": 5,
-        "ping_timeout": 6,
+        "ping_interval": None,
+        "ping_timeout": None,
         "close_timeout": 4,
         "max_size": 262_144,
         "max_queue": 7,
