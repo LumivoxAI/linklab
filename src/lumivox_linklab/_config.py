@@ -4,6 +4,7 @@ from dataclasses import field, dataclass
 
 _ALLOWED_OUTPUT_RATES = (24_000, 48_000, 16_000)
 _CLIENT_OUTPUT_ORDER = {rate: index for index, rate in enumerate(_ALLOWED_OUTPUT_RATES)}
+_REQUIRED_CAPABILITIES = ("barge_in", "playback_accounting", "speech_spans")
 
 
 def _require_int(name: str, value: object, minimum: int, maximum: int | None = None) -> None:

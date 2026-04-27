@@ -13,15 +13,21 @@ from websockets.asyncio.server import Server, ServerConnection, serve
 
 from ._codec import Primitive, decode_message, encode_message, _decode_primitive_message
 from ._enums import ErrorCode, ErrorScope, MessageDirection
-from ._config import AudioFormat, ClientConfig, ServerConfig, ConnectionLimits
+from ._config import (
+    _REQUIRED_CAPABILITIES,
+    AudioFormat,
+    ClientConfig,
+    ServerConfig,
+    ConnectionLimits,
+)
 from ._errors import CodecError, ConnectionClosed
+from ._schema import known_message_types, decode_schema_message
 from ._messages import ErrorEvent, ClientHello, ServerHello
 
 _SUBPROTOCOL = Subprotocol("lumivox.voice.v1")
 _VERSION = 1
 _MAX_MESSAGE_BYTES = 262_144
 _MAX_FIRST_MESSAGE_BYTES = 16_384
-_REQUIRED_CAPABILITIES = ("barge_in", "playback_accounting", "speech_spans")
 _INPUT_FORMAT = AudioFormat("pcm_s16le", 16_000, 1)
 
 
@@ -236,11 +242,8 @@ def _classify_hello_fields(message: dict[str, Primitive], direction: MessageDire
     if any(name not in message for name in format_fields):
         raise _InvalidHello(ErrorCode.MALFORMED_MESSAGE, "missing audio format")
     try:
-        decode_message(
-            encode_message(_hello_without_agent(message, direction)),
-            direction=direction,
-            limits=ConnectionLimits(),
-        )
+        candidate = {name: value for name, value in message.items() if name != "agent"}
+        decode_schema_message(candidate, direction)
     except (CodecError, TypeError, ValueError) as error:
         raise _InvalidHello(ErrorCode.FORMAT_MISMATCH, "invalid audio format") from error
 
@@ -287,32 +290,4 @@ def _primitive_int(value: dict[str, Primitive], name: str) -> int:
 
 
 def _known_message_types(direction: MessageDirection) -> frozenset[str]:
-    if direction is MessageDirection.CLIENT_TO_SERVER:
-        return frozenset(
-            {
-                "conversation.start",
-                "input.start",
-                "input.audio",
-                "input.abort",
-                "playback.finished",
-                "playback.interrupted",
-                "conversation.cancel",
-            }
-        )
-    return frozenset(
-        {
-            "state",
-            "input.closed",
-            "transcript.update",
-            "transcript.final",
-            "response.start",
-            "response.text.delta",
-            "response.text.final",
-            "output.start",
-            "output.audio",
-            "output.end",
-            "response.end",
-            "response.cancelled",
-            "conversation.end",
-        }
-    )
+    return known_message_types(direction)

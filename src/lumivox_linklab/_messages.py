@@ -15,14 +15,17 @@ from ._enums import (
     PlaybackInterruptReason,
     ConversationCancelReason,
 )
-from ._config import AudioFormat, ConnectionLimits
+from ._config import (
+    _REQUIRED_CAPABILITIES,
+    AudioFormat,
+    ConnectionLimits,
+    _validate_output_formats,
+)
 from ._values import InputId, OutputId, ResponseId, ConversationId, ReadableBuffer
 
 _MAX_ID = 4_294_967_295
 _MAX_FRAME = 9_223_372_036_854_775_807
 _MAX_TEXT_BYTES = 65_536
-_REQUIRED_CAPABILITIES = frozenset({"barge_in", "playback_accounting", "speech_spans"})
-_OUTPUT_RATES = (24_000, 48_000, 16_000)
 
 _CONNECTION_ERROR_CODES = frozenset(
     {
@@ -141,25 +144,12 @@ def _validate_capabilities(capabilities: object) -> None:
         raise ValueError("capabilities must be unique")
     if capabilities != tuple(sorted(capabilities, key=str.encode)):
         raise ValueError("capabilities must be sorted by UTF-8 bytes")
-    if not _REQUIRED_CAPABILITIES.issubset(capabilities):
+    if not set(_REQUIRED_CAPABILITIES).issubset(capabilities):
         raise ValueError("capabilities must include all required capabilities")
 
 
 def _validate_client_output_formats(output_formats: object) -> None:
-    if type(output_formats) is not tuple:
-        raise TypeError("output_formats must be a tuple")
-    if not 1 <= len(output_formats) <= 3:
-        raise ValueError("output_formats must contain 1..3 formats")
-    if not all(isinstance(item, AudioFormat) for item in output_formats):
-        raise TypeError("output_formats entries must be AudioFormat values")
-    rates = tuple(item.sample_rate_hz for item in output_formats)
-    if len(set(rates)) != len(rates):
-        raise ValueError("output_formats must not contain duplicate rates")
-    if 16_000 not in rates:
-        raise ValueError("output_formats must include 16000 Hz")
-    expected = tuple(rate for rate in _OUTPUT_RATES if rate in rates)
-    if rates != expected:
-        raise ValueError("output_formats must use canonical preference order")
+    _validate_output_formats(output_formats, canonical_order=True)
 
 
 @dataclass(frozen=True, slots=True)

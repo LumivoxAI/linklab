@@ -1,25 +1,15 @@
 from enum import StrEnum
-from typing import Never, Literal, cast
-from collections.abc import Callable
+from typing import Never, cast
 
 import msgpack  # type: ignore[import-untyped]
 
 from ._enums import (
     ErrorCode,
-    ErrorScope,
-    CoarseState,
-    InputAbortReason,
-    InputCloseReason,
-    InputStartReason,
     MessageDirection,
-    PlaybackPosition,
-    ResponseCancelReason,
-    ConversationEndReason,
-    PlaybackInterruptReason,
-    ConversationCancelReason,
 )
 from ._config import AudioFormat, ConnectionLimits
 from ._errors import CodecError
+from ._schema import known_message_types, message_to_primitive, decode_schema_message
 from ._values import InputId, OutputId, ResponseId, ConversationId, ReadableBuffer
 from ._messages import (
     Message,
@@ -218,13 +208,35 @@ def _array(message: dict[str, Primitive], name: str) -> list[Primitive]:
     return value
 
 
-def _enum[E: StrEnum](message: dict[str, Primitive], name: str, enum_type: type[E]) -> E:
-    value = _string(message, name)
-    assert value is not None
-    try:
-        return enum_type(value)
-    except ValueError as error:
-        raise CodecError(f"{name} has an unknown value") from error
+def _audio_format_from_primitive(value: dict[str, Primitive]) -> AudioFormat:
+    encoding = _string(value, "encoding")
+    assert encoding is not None
+    return AudioFormat(encoding, _integer(value, "sample_rate_hz"), _integer(value, "channels"))
+
+
+def _connection_limits_from_primitive(value: dict[str, Primitive]) -> ConnectionLimits:
+    return ConnectionLimits(
+        max_message_bytes=_integer(value, "max_message_bytes"),
+        max_input_audio_frames=_integer(value, "max_input_audio_frames"),
+        max_output_audio_frames=_integer(value, "max_output_audio_frames"),
+        max_text_bytes=_integer(value, "max_text_bytes"),
+        max_input_frames=_integer(value, "max_input_frames"),
+        idle_timeout_ms=_integer(value, "idle_timeout_ms"),
+    )
+
+
+# Kept as small nested-structure adapters for the handshake classifier and the
+# schema migration boundary; message field metadata lives in _schema.
+_audio_format = _audio_format_from_primitive
+_connection_limits = _connection_limits_from_primitive
+
+
+def _capabilities(message: dict[str, Primitive]) -> tuple[str, ...]:
+    return _string_tuple_from_primitive(_field(message, "capabilities"), "capabilities")  # type: ignore[arg-type]
+
+
+def _output_formats(message: dict[str, Primitive]) -> tuple[AudioFormat, ...]:
+    return _audio_formats_from_primitive(_field(message, "output_formats"), "output_formats")  # type: ignore[arg-type]
 
 
 def _conversation_id(message: dict[str, Primitive]) -> ConversationId:
@@ -243,39 +255,62 @@ def _output_id(message: dict[str, Primitive]) -> OutputId:
     return OutputId(_integer(message, "output_id"))
 
 
-def _audio_format(value: dict[str, Primitive]) -> AudioFormat:
-    encoding = _string(value, "encoding")
-    assert encoding is not None
-    return AudioFormat(encoding, _integer(value, "sample_rate_hz"), _integer(value, "channels"))
+def _enum[E: StrEnum](message: dict[str, Primitive], name: str, enum_type: type[E]) -> E:
+    value = _string(message, name)
+    assert value is not None
+    try:
+        return enum_type(value)
+    except ValueError as error:
+        raise CodecError(f"{name} has an unknown value") from error
 
 
-def _connection_limits(value: dict[str, Primitive]) -> ConnectionLimits:
-    return ConnectionLimits(
-        max_message_bytes=_integer(value, "max_message_bytes"),
-        max_input_audio_frames=_integer(value, "max_input_audio_frames"),
-        max_output_audio_frames=_integer(value, "max_output_audio_frames"),
-        max_text_bytes=_integer(value, "max_text_bytes"),
-        max_input_frames=_integer(value, "max_input_frames"),
-        idle_timeout_ms=_integer(value, "idle_timeout_ms"),
-    )
-
-
-def _capabilities(message: dict[str, Primitive]) -> tuple[str, ...]:
+def _string_tuple_from_primitive(value: Primitive, name: str) -> tuple[str, ...]:
+    if type(value) is not list:
+        raise CodecError(f"{name} must be an array")
     result: list[str] = []
-    for value in _array(message, "capabilities"):
-        if type(value) is not str:
-            raise CodecError("capabilities entries must be strings")
-        result.append(value)
+    for item in value:
+        if type(item) is not str:
+            raise CodecError(f"{name} entries must be strings")
+        result.append(item)
     return tuple(result)
 
 
-def _output_formats(message: dict[str, Primitive]) -> tuple[AudioFormat, ...]:
+def _audio_formats_from_primitive(value: Primitive, name: str) -> tuple[AudioFormat, ...]:
+    if type(value) is not list:
+        raise CodecError(f"{name} must be an array")
     result: list[AudioFormat] = []
-    for value in _array(message, "output_formats"):
-        if type(value) is not dict:
-            raise CodecError("output_formats entries must be maps")
-        result.append(_audio_format(value))
+    for item in value:
+        if type(item) is not dict:
+            raise CodecError(f"{name} entries must be maps")
+        result.append(_audio_format_from_primitive(item))
     return tuple(result)
+
+
+def _audio_format_to_primitive(audio_format: AudioFormat) -> dict[str, Primitive]:
+    if not isinstance(audio_format, AudioFormat):
+        raise CodecError("audio format field must be an AudioFormat")
+    return {
+        "encoding": audio_format.encoding,
+        "sample_rate_hz": audio_format.sample_rate_hz,
+        "channels": audio_format.channels,
+    }
+
+
+def _connection_limits_to_primitive(limits: ConnectionLimits) -> dict[str, Primitive]:
+    if not isinstance(limits, ConnectionLimits):
+        raise CodecError("limits field must be ConnectionLimits")
+    return {
+        "max_message_bytes": limits.max_message_bytes,
+        "max_input_audio_frames": limits.max_input_audio_frames,
+        "max_output_audio_frames": limits.max_output_audio_frames,
+        "max_text_bytes": limits.max_text_bytes,
+        "max_input_frames": limits.max_input_frames,
+        "idle_timeout_ms": limits.idle_timeout_ms,
+    }
+
+
+_audio_format_primitive = _audio_format_to_primitive
+_connection_limits_primitive = _connection_limits_to_primitive
 
 
 def _validate_field_names_and_unknown_binary(root: dict[str, Primitive]) -> None:
@@ -291,195 +326,6 @@ def _validate_field_names_and_unknown_binary(root: dict[str, Primitive]) -> None
             stack.extend(value)
         elif type(value) is bytes and len(value) > _MAX_BINARY_BYTES:
             raise CodecError("non-audio binary exceeds the absolute limit")
-
-
-def _decode_client_message(message: dict[str, Primitive], message_type: str) -> Message:
-    if message_type == "hello":
-        return ClientHello(
-            _integer(message, "version"),
-            _capabilities(message),
-            _audio_format(_map(message, "input_format")),
-            _output_formats(message),
-            _string(message, "agent", optional=True),
-        )
-    if message_type == "conversation.start":
-        activation = _string(message, "activation")
-        assert activation is not None
-        return ConversationStartedEvent(
-            _conversation_id(message),
-            cast(Literal["wake_word"], activation),
-            _string(message, "wake_word", optional=True),
-        )
-    if message_type == "input.start":
-        interrupts = _field(message, "interrupts_response_id", optional=True)
-        return InputStartedEvent(
-            _conversation_id(message),
-            _input_id(message),
-            _enum(message, "reason", InputStartReason),
-            _integer(message, "generation"),
-            None if interrupts is _MISSING else ResponseId(_required_int_value(interrupts, "interrupts_response_id")),
-        )
-    if message_type == "input.audio":
-        return InputAudioEvent(
-            _conversation_id(message),
-            _input_id(message),
-            _integer(message, "start_frame"),
-            _boolean(message, "speech"),
-            _binary(message, "audio"),
-        )
-    if message_type == "input.abort":
-        return InputAbortedEvent(
-            _conversation_id(message), _input_id(message), _enum(message, "reason", InputAbortReason)
-        )
-    if message_type == "playback.finished":
-        return PlaybackFinishedEvent(
-            _conversation_id(message),
-            _response_id(message),
-            _output_id(message),
-            _integer(message, "played_frames"),
-        )
-    if message_type == "playback.interrupted":
-        return PlaybackInterruptedEvent(
-            _conversation_id(message),
-            _response_id(message),
-            _output_id(message),
-            _integer(message, "played_frames"),
-            _enum(message, "position", PlaybackPosition),
-            _enum(message, "reason", PlaybackInterruptReason),
-        )
-    if message_type == "conversation.cancel":
-        return ConversationCancelledEvent(_conversation_id(message), _enum(message, "reason", ConversationCancelReason))
-    raise CodecError(f"unknown client-to-server message type: {message_type}")
-
-
-def _required_int_value(value: object, name: str) -> int:
-    if type(value) is not int:
-        raise CodecError(f"{name} must be an integer")
-    return value
-
-
-def _decode_server_message(message: dict[str, Primitive], message_type: str) -> Message:
-    if message_type == "hello":
-        return ServerHello(
-            _integer(message, "version"),
-            _capabilities(message),
-            _audio_format(_map(message, "output_format")),
-            _connection_limits(_map(message, "limits")),
-            _string(message, "agent", optional=True),
-        )
-    if message_type == "state":
-        return StateEvent(
-            _conversation_id(message),
-            _integer(message, "revision"),
-            _enum(message, "state", CoarseState),
-            _string(message, "reason", optional=True),
-        )
-    if message_type == "input.closed":
-        return InputClosedEvent(
-            _conversation_id(message),
-            _input_id(message),
-            _integer(message, "accepted_end_frame"),
-            _enum(message, "reason", InputCloseReason),
-        )
-    if message_type == "transcript.update":
-        text = _string(message, "text")
-        assert text is not None
-        return TranscriptUpdateEvent(
-            _conversation_id(message),
-            _input_id(message),
-            _integer(message, "revision"),
-            text,
-            _string(message, "language", optional=True),
-        )
-    if message_type == "transcript.final":
-        text = _string(message, "text")
-        assert text is not None
-        return TranscriptFinalEvent(
-            _conversation_id(message), _input_id(message), text, _string(message, "language", optional=True)
-        )
-    if message_type == "response.start":
-        return ResponseStartedEvent(
-            _conversation_id(message),
-            _response_id(message),
-            _input_id(message),
-            _boolean(message, "end_conversation"),
-        )
-    if message_type == "response.text.delta":
-        text = _string(message, "text")
-        assert text is not None
-        return ResponseTextDeltaEvent(
-            _conversation_id(message), _response_id(message), _integer(message, "sequence"), text
-        )
-    if message_type == "response.text.final":
-        text = _string(message, "text")
-        assert text is not None
-        return ResponseTextFinalEvent(_conversation_id(message), _response_id(message), text)
-    if message_type == "output.start":
-        return OutputStartedEvent(_conversation_id(message), _response_id(message), _output_id(message))
-    if message_type == "output.audio":
-        return OutputAudioEvent(
-            _conversation_id(message),
-            _response_id(message),
-            _output_id(message),
-            _integer(message, "start_frame"),
-            _binary(message, "audio"),
-        )
-    if message_type == "output.end":
-        return OutputEndedEvent(
-            _conversation_id(message),
-            _response_id(message),
-            _output_id(message),
-            _integer(message, "total_frames"),
-        )
-    if message_type == "response.end":
-        return ResponseEndedEvent(_conversation_id(message), _response_id(message))
-    if message_type == "response.cancelled":
-        return ResponseCancelledEvent(
-            _conversation_id(message), _response_id(message), _enum(message, "reason", ResponseCancelReason)
-        )
-    if message_type == "conversation.end":
-        return ConversationEndedEvent(_conversation_id(message), _enum(message, "reason", ConversationEndReason))
-    if message_type == "error":
-        return _decode_error(message)
-    raise CodecError(f"unknown server-to-client message type: {message_type}")
-
-
-def _optional_id[T](message: dict[str, Primitive], name: str, id_type: Callable[[int], T]) -> T | None:
-    value = _field(message, name, optional=True)
-    if value is _MISSING:
-        return None
-    return id_type(_required_int_value(value, name))
-
-
-def _decode_error(message: dict[str, Primitive]) -> ErrorEvent:
-    return ErrorEvent(
-        _enum(message, "scope", ErrorScope),
-        _enum(message, "code", ErrorCode),
-        _boolean(message, "fatal"),
-        _optional_id(message, "conversation_id", ConversationId),
-        _optional_id(message, "input_id", InputId),
-        _optional_id(message, "response_id", ResponseId),
-        _string(message, "message", optional=True),
-    )
-
-
-def _audio_format_primitive(audio_format: AudioFormat) -> dict[str, Primitive]:
-    return {
-        "encoding": audio_format.encoding,
-        "sample_rate_hz": audio_format.sample_rate_hz,
-        "channels": audio_format.channels,
-    }
-
-
-def _connection_limits_primitive(limits: ConnectionLimits) -> dict[str, Primitive]:
-    return {
-        "max_message_bytes": limits.max_message_bytes,
-        "max_input_audio_frames": limits.max_input_audio_frames,
-        "max_output_audio_frames": limits.max_output_audio_frames,
-        "max_text_bytes": limits.max_text_bytes,
-        "max_input_frames": limits.max_input_frames,
-        "idle_timeout_ms": limits.idle_timeout_ms,
-    }
 
 
 def _message_to_primitive(message: Message) -> dict[str, Primitive]:
@@ -696,7 +542,7 @@ def _canonicalize(value: Primitive) -> Primitive:
 
 def _pack_message(message: Message) -> bytes:
     try:
-        primitive = _canonicalize(_message_to_primitive(message))
+        primitive = _canonicalize(cast(Primitive, message_to_primitive(message)))
         return cast(bytes, msgpack.packb(primitive, use_bin_type=True, strict_types=True))
     except CodecError:
         raise
@@ -744,37 +590,8 @@ def _enforce_operational_limits(message: Message, limits: ConnectionLimits) -> N
         raise _OperationalLimitError("text exceeds the negotiated byte limit")
 
 
-_CLIENT_MESSAGE_TYPES = frozenset(
-    {
-        "hello",
-        "conversation.start",
-        "input.start",
-        "input.audio",
-        "input.abort",
-        "playback.finished",
-        "playback.interrupted",
-        "conversation.cancel",
-    }
-)
-_SERVER_MESSAGE_TYPES = frozenset(
-    {
-        "hello",
-        "state",
-        "input.closed",
-        "transcript.update",
-        "transcript.final",
-        "response.start",
-        "response.text.delta",
-        "response.text.final",
-        "output.start",
-        "output.audio",
-        "output.end",
-        "response.end",
-        "response.cancelled",
-        "conversation.end",
-        "error",
-    }
-)
+_CLIENT_MESSAGE_TYPES = known_message_types(MessageDirection.CLIENT_TO_SERVER, include_handshake=True)
+_SERVER_MESSAGE_TYPES = known_message_types(MessageDirection.SERVER_TO_CLIENT, include_handshake=True)
 
 
 def _decode_message_for_transport(
@@ -832,11 +649,7 @@ def decode_message(
         raise CodecError("type exceeds the 64-byte limit")
 
     try:
-        message = (
-            _decode_client_message(primitive, message_type)
-            if direction is MessageDirection.CLIENT_TO_SERVER
-            else _decode_server_message(primitive, message_type)
-        )
+        message = decode_schema_message(primitive, direction)
     except CodecError:
         raise
     except (TypeError, ValueError) as error:
