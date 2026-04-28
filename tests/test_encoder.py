@@ -7,6 +7,7 @@ import msgpack  # type: ignore[import-untyped]
 
 import lumivox_linklab as linklab
 from lumivox_linklab._codec import _encode_message_with_limits
+from lumivox_linklab._schema import _SCHEMAS
 
 ROOT = Path(__file__).parents[1]
 MANIFEST = ROOT / "fixtures" / "protocol-v1.json"
@@ -67,6 +68,15 @@ def test_golden_manifest_covers_every_message_and_round_trips() -> None:
         linklab.ConversationEndedEvent,
         linklab.ErrorEvent,
     }
+
+
+def test_schema_registry_has_one_bidirectional_mapping_per_message_model() -> None:
+    wire_keys = {(schema.direction, schema.wire_type) for schema in _SCHEMAS}
+    model_types = {schema.model_type for schema in _SCHEMAS}
+
+    assert len(_SCHEMAS) == 23
+    assert len(wire_keys) == len(_SCHEMAS)
+    assert len(model_types) == len(_SCHEMAS)
 
 
 def test_encoder_sorts_every_map_by_utf8_key_bytes() -> None:
