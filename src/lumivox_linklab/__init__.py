@@ -17,6 +17,7 @@ from ._enums import (
     PlaybackInterruptReason,
     ConversationCancelReason,
 )
+from ._client import VoiceClient, ClientCallbacks
 from ._config import AudioFormat, ClientConfig, ServerConfig, ConnectionLimits
 from ._errors import CodecError, LinklabError, WriterClosed, QueueOverflow, ConnectionClosed, ProtocolViolation
 from ._values import (
@@ -65,6 +66,7 @@ __all__ = [
     "AudioFormat",
     "AudioSubmitResult",
     "ClientConfig",
+    "ClientCallbacks",
     "ClientHello",
     "ClientMessage",
     "CoarseState",
@@ -125,4 +127,5 @@ __all__ = [
     "TranscriptFinalEvent",
     "TranscriptUpdateEvent",
     "WriterClosed",
+    "VoiceClient",
 ]

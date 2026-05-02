@@ -12,11 +12,16 @@ from ._enums import (
     ConnectionState,
     InputAbortReason,
     InputStartReason,
+    PlaybackPosition,
     AudioSubmitResult,
+    PlaybackInterruptReason,
+    ConversationCancelReason,
 )
 from ._config import ClientConfig, ConnectionLimits
+from ._errors import ProtocolViolation
 from ._values import (
     InputId,
+    OutputId,
     ResponseId,
     AnnotatedAudio,
     ConversationId,
@@ -30,10 +35,13 @@ from ._messages import (
     InputClosedEvent,
     InputAbortedEvent,
     InputStartedEvent,
+    PlaybackFinishedEvent,
     ConversationEndedEvent,
     ConversationStartedEvent,
+    PlaybackInterruptedEvent,
+    ConversationCancelledEvent,
 )
-from ._protocol import ProtocolValidator, _Input, _ValidatorData, _TransitionResult
+from ._protocol import ProtocolValidator, _Input, _Response, _ValidatorData, _TransitionResult
 
 _MAX_SEQUENCE: Final = 4_294_967_295
 
@@ -48,7 +56,7 @@ class _IngressBatch:
     messages: tuple[Message, ...]
     lane: _IngressLane
     audio_frames: int
-    input_id: InputId
+    input_id: InputId | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,17 +109,29 @@ class _ClientAudioIngress:
         self._pre_roll: deque[_AudioSpan] = deque()
         self._pre_roll_frames = 0
 
-    def start(self, client_hello: ClientHello, server_hello: ServerHello) -> None:
+    def transport_connected(self) -> None:
+        with self._lock:
+            self._validator.transport_connected()
+
+    def complete_handshake(self, client_hello: ClientHello, server_hello: ServerHello) -> None:
         if not isinstance(client_hello, ClientHello):
             raise TypeError("client_hello must be ClientHello")
         if not isinstance(server_hello, ServerHello):
             raise TypeError("server_hello must be ServerHello")
         with self._lock:
-            self._validator.transport_connected()
             data, _ = self._validator._transition(self._validator._data, client_hello)
             data, _ = self._validator._transition(data, server_hello)
             self._validator._data = data
             self._limits = server_hello.limits
+
+    def start(self, client_hello: ClientHello, server_hello: ServerHello) -> None:
+        self.transport_connected()
+        self.complete_handshake(client_hello, server_hello)
+
+    def begin_close(self) -> None:
+        with self._lock:
+            if self._validator.state.connection_state in (ConnectionState.HANDSHAKING, ConnectionState.READY):
+                self._validator.begin_close()
 
     def stop(self) -> None:
         with self._lock:
@@ -152,6 +172,71 @@ class _ClientAudioIngress:
             else:
                 self._validator._data = candidate
                 accepted = True
+        self._deliver_notification()
+        return accepted
+
+    def cancel_conversation(self, reason: ConversationCancelReason) -> bool:
+        if not isinstance(reason, ConversationCancelReason):
+            raise TypeError("reason must be ConversationCancelReason")
+        with self._lock:
+            data = self._validator._data
+            conversation = data.conversation
+            if (
+                data.connection_state is not ConnectionState.READY
+                or conversation is None
+                or conversation.cancel is not None
+                or conversation.failure is not None
+                or self._failure is not None
+            ):
+                return False
+            message = ConversationCancelledEvent(conversation.conversation_id, reason)
+            accepted = self._commit_control_locked(data, message, conversation.input_id)
+        self._deliver_notification()
+        return accepted
+
+    def playback_finished(self, output_id: OutputId, played_frames: int) -> bool:
+        self._validate_output_id(output_id)
+        with self._lock:
+            data = self._validator._data
+            response = self._response_for_output(data, output_id)
+            if data.connection_state is not ConnectionState.READY or response is None or self._failure is not None:
+                return False
+            message = PlaybackFinishedEvent(
+                response.start.conversation_id,
+                response.start.response_id,
+                output_id,
+                played_frames,
+            )
+            accepted = self._commit_control_locked(data, message, None)
+        self._deliver_notification()
+        return accepted
+
+    def playback_interrupted(
+        self,
+        output_id: OutputId,
+        played_frames: int,
+        position: PlaybackPosition,
+        reason: PlaybackInterruptReason,
+    ) -> bool:
+        self._validate_output_id(output_id)
+        if not isinstance(position, PlaybackPosition):
+            raise TypeError("position must be PlaybackPosition")
+        if not isinstance(reason, PlaybackInterruptReason):
+            raise TypeError("reason must be PlaybackInterruptReason")
+        with self._lock:
+            data = self._validator._data
+            response = self._response_for_output(data, output_id)
+            if data.connection_state is not ConnectionState.READY or response is None or self._failure is not None:
+                return False
+            message = PlaybackInterruptedEvent(
+                response.start.conversation_id,
+                response.start.response_id,
+                output_id,
+                played_frames,
+                position,
+                reason,
+            )
+            accepted = self._commit_control_locked(data, message, None)
         self._deliver_notification()
         return accepted
 
@@ -382,7 +467,7 @@ class _ClientAudioIngress:
         messages: tuple[Message, ...],
         lane: _IngressLane,
         audio_frames: int,
-        input_id: InputId,
+        input_id: InputId | None,
     ) -> bool:
         if lane is _IngressLane.DATA:
             if self._occupancy_frames + audio_frames > self._config.input_queue_frames:
@@ -399,6 +484,22 @@ class _ClientAudioIngress:
             self._control_occupancy += 1
         if was_empty:
             self._notification_pending = True
+        return True
+
+    def _commit_control_locked(
+        self,
+        data: _ValidatorData,
+        message: Message,
+        input_id: InputId | None,
+    ) -> bool:
+        try:
+            candidate, _ = self._validator._transition(data, message)
+        except ProtocolViolation:
+            return False
+        if not self._enqueue_locked((message,), _IngressLane.CONTROL, 0, input_id):
+            self._fail_locked("reserved ingress control capacity exhausted")
+            return False
+        self._validator._data = candidate
         return True
 
     def _discard_input_audio_locked(self, input_id: InputId, accepted_end_frame: int) -> None:
@@ -478,6 +579,19 @@ class _ClientAudioIngress:
         if conversation is None or conversation.input_id is None:
             return None
         return self._validator._find_input(data, conversation.input_id)
+
+    def _response_for_output(self, data: _ValidatorData, output_id: OutputId) -> _Response | None:
+        for response in reversed(data.responses):
+            if response.output is not None and response.output.start.output_id == output_id:
+                if response.playback is not None:
+                    return None
+                return response
+        return None
+
+    @staticmethod
+    def _validate_output_id(output_id: OutputId) -> None:
+        if type(output_id) is not int or not 1 <= output_id <= 4_294_967_295:
+            raise ValueError("output_id must be an integer in 1..4294967295")
 
     @staticmethod
     def _copy_and_validate(annotated: AnnotatedAudio) -> bytes:

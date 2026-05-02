@@ -48,6 +48,7 @@ class _OutboundBatch:
     lane: _QueueLane
     weight: int
     enqueued_at: float
+    tag: object | None = None
     terminal: bool = False
 
 
@@ -90,7 +91,14 @@ class _BoundedBatchQueue:
         self._available = asyncio.Event()
         self._closed = False
 
-    def put_nowait(self, frames: tuple[bytes, ...], *, lane: _QueueLane, weight: int) -> None:
+    def put_nowait(
+        self,
+        frames: tuple[bytes, ...],
+        *,
+        lane: _QueueLane,
+        weight: int,
+        tag: object | None = None,
+    ) -> None:
         if self._closed:
             raise ConnectionClosed("transport queue is closed")
         if not isinstance(lane, _QueueLane):
@@ -102,7 +110,7 @@ class _BoundedBatchQueue:
         if self._occupancy[lane] + weight > self._capacities[lane]:
             self._overflows[lane] += 1
             raise QueueOverflow(f"{self._identity} {lane.value} capacity exceeded")
-        self._items.append(_OutboundBatch(frames, lane, weight, self._clock()))
+        self._items.append(_OutboundBatch(frames, lane, weight, self._clock(), tag))
         self._occupancy[lane] += weight
         self._available.set()
 
@@ -175,6 +183,7 @@ class _BoundedBatchQueue:
 type _TransitionHook = Callable[[Message, _TransitionResult], None]
 type _LossHook = Callable[[BaseException], None]
 type _RttHook = Callable[[float], None]
+type _SpaceHook = Callable[[], None]
 
 
 class _TransportCore:
@@ -192,6 +201,7 @@ class _TransportCore:
         ping_interval_s: float = 20.0,
         ping_timeout_s: float = 20.0,
         on_rtt: _RttHook | None = None,
+        on_outbound_space: _SpaceHook | None = None,
         occupancy_unit: str = "units",
         clock: Callable[[], float] | None = None,
     ) -> None:
@@ -218,6 +228,7 @@ class _TransportCore:
         self._on_transition = on_transition
         self._on_transport_loss = on_transport_loss
         self._on_rtt = on_rtt
+        self._on_outbound_space = on_outbound_space
         self._validator = ProtocolValidator(role)
         self._queue = _BoundedBatchQueue(
             identity="outbound",
@@ -280,6 +291,7 @@ class _TransportCore:
         *,
         lane: _QueueLane,
         weight: int | None = None,
+        tag: object | None = None,
     ) -> None:
         self._check_loop()
         if self._reader_task is None:
@@ -296,7 +308,7 @@ class _TransportCore:
             wire_messages.append(message)
             wire_messages.extend(result.outbound)
         frames = tuple(_encode_message_with_limits(message, self._limits) for message in wire_messages)
-        self._queue.put_nowait(frames, lane=lane, weight=len(frames) if weight is None else weight)
+        self._queue.put_nowait(frames, lane=lane, weight=len(frames) if weight is None else weight, tag=tag)
         self._validator._data = data
 
     def snapshots(self) -> tuple[_QueueSnapshot, _QueueSnapshot]:
@@ -385,6 +397,11 @@ class _TransportCore:
         try:
             while True:
                 batch = await self._queue.get()
+                if self._on_outbound_space is not None:
+                    try:
+                        self._on_outbound_space()
+                    except Exception:
+                        pass
                 for frame in batch.frames:
                     if self._fatal and not batch.terminal:
                         break
