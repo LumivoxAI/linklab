@@ -262,6 +262,63 @@ def test_capture_failure_aborts_exactly_once_and_rejects_later_pcm() -> None:
     ]
 
 
+def test_conversation_cancel_is_thread_safe_and_enqueued_once() -> None:
+    ingress = make_ingress()
+    assert ingress.submit(annotated(10, activated=True)) is linklab.AudioSubmitResult.ACCEPTED
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        assert executor.submit(ingress.cancel_conversation, linklab.ConversationCancelReason.USER).result() is True
+        assert executor.submit(ingress.cancel_conversation, linklab.ConversationCancelReason.USER).result() is False
+
+    batches = take_all(ingress)
+    assert batches[-1].messages == (
+        linklab.ConversationCancelledEvent(linklab.ConversationId(1), linklab.ConversationCancelReason.USER),
+    )
+
+
+def test_playback_accounting_uses_known_output_and_accepts_one_outcome() -> None:
+    ingress = make_ingress()
+    assert ingress.submit(annotated(10, activated=True)) is linklab.AudioSubmitResult.ACCEPTED
+    take_all(ingress)
+    finish_input_and_response(ingress, linklab.InputId(1), 10, finish_response=False)
+    ingress.accept_inbound(
+        linklab.OutputStartedEvent(linklab.ConversationId(1), linklab.ResponseId(1), linklab.OutputId(1))
+    )
+    ingress.accept_inbound(
+        linklab.OutputAudioEvent(
+            linklab.ConversationId(1),
+            linklab.ResponseId(1),
+            linklab.OutputId(1),
+            0,
+            pcm(4),
+        )
+    )
+    ingress.accept_inbound(
+        linklab.OutputEndedEvent(
+            linklab.ConversationId(1),
+            linklab.ResponseId(1),
+            linklab.OutputId(1),
+            4,
+        )
+    )
+
+    assert ingress.playback_finished(linklab.OutputId(2), 4) is False
+    assert ingress.playback_finished(linklab.OutputId(1), 3) is False
+    assert ingress.playback_finished(linklab.OutputId(1), 4) is True
+    assert ingress.playback_finished(linklab.OutputId(1), 4) is False
+
+    batch = ingress.next_batch()
+    assert batch is not None
+    assert batch.messages == (
+        linklab.PlaybackFinishedEvent(
+            linklab.ConversationId(1),
+            linklab.ResponseId(1),
+            linklab.OutputId(1),
+            4,
+        ),
+    )
+
+
 def test_server_close_discards_unsent_audio_and_returns_closed_input() -> None:
     ingress = make_ingress()
     assert ingress.submit(annotated(10, activated=True)) is linklab.AudioSubmitResult.ACCEPTED
