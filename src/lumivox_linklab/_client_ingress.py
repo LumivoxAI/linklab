@@ -4,7 +4,7 @@ from enum import StrEnum
 from typing import Final
 from threading import Lock
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import replace, dataclass
 from collections.abc import Callable
 
 from ._enums import (
@@ -33,10 +33,14 @@ from ._messages import (
     ServerHello,
     InputAudioEvent,
     InputClosedEvent,
+    OutputAudioEvent,
     InputAbortedEvent,
     InputStartedEvent,
     PlaybackFinishedEvent,
     ConversationEndedEvent,
+    ResponseCancelledEvent,
+    ResponseTextDeltaEvent,
+    ResponseTextFinalEvent,
     ConversationStartedEvent,
     PlaybackInterruptedEvent,
     ConversationCancelledEvent,
@@ -108,6 +112,7 @@ class _ClientAudioIngress:
         self._generation: int | None = None
         self._pre_roll: deque[_AudioSpan] = deque()
         self._pre_roll_frames = 0
+        self._confirmed_response_cancellations: set[ResponseId] = set()
 
     def transport_connected(self) -> None:
         with self._lock:
@@ -145,6 +150,7 @@ class _ClientAudioIngress:
             self._failure = None
             self._notification_error = None
             self._generation = None
+            self._confirmed_response_cancellations.clear()
             self._clear_pre_roll_locked()
 
     def submit(self, annotated: AnnotatedAudio) -> AudioSubmitResult:
@@ -244,12 +250,24 @@ class _ClientAudioIngress:
         with self._lock:
             data, result = self._validator._transition(self._validator._data, message)
             self._validator._data = data
+            if isinstance(message, ResponseCancelledEvent):
+                if message.response_id not in self._confirmed_response_cancellations:
+                    self._confirmed_response_cancellations.add(message.response_id)
+                    result = replace(result, dispatch=True)
             if isinstance(message, InputClosedEvent):
                 self._discard_input_audio_locked(message.input_id, message.accepted_end_frame)
             if isinstance(message, ConversationEndedEvent):
                 self._generation = None
                 self._clear_pre_roll_locked()
             return result
+
+    def is_current(self, message: Message) -> bool:
+        """Return whether queued response content is still publishable."""
+        with self._lock:
+            if isinstance(message, (ResponseTextDeltaEvent, ResponseTextFinalEvent, OutputAudioEvent)):
+                response = self._validator._find_response(self._validator._data, message.response_id)
+                return response is not None and not response.stale
+            return True
 
     def next_batch(self) -> _IngressBatch | None:
         with self._lock:
