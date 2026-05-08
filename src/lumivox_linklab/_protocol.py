@@ -184,7 +184,7 @@ class ProtocolValidator:
         input_ = self._find_input(self._data, input_id)
         if input_ is None:
             raise ProtocolViolation("committed input boundary targets no known input")
-        if input_.terminal is not None:
+        if isinstance(input_.terminal, InputClosedEvent):
             raise ProtocolViolation("terminal input boundary is immutable")
         if not input_.committed_end_frame <= end_frame <= input_.received_end_frame:
             raise ProtocolViolation("committed input boundary must be monotonic and already received")
@@ -193,7 +193,7 @@ class ProtocolValidator:
         input_ = replace(input_, committed_end_frame=end_frame)
         self._data = self._replace_input(self._data, input_)
         limits = self._data.server_hello.limits if self._data.server_hello is not None else None
-        if limits is None or end_frame != limits.max_input_frames:
+        if limits is None or end_frame != limits.max_input_frames or input_.terminal is not None:
             return ()
         close = InputClosedEvent(
             input_.start.conversation_id,

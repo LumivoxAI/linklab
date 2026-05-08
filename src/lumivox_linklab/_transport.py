@@ -13,6 +13,7 @@ from ._codec import _InboundMessageError, _encode_message_with_limits, _decode_m
 from ._enums import ErrorCode, ErrorScope, EndpointRole, ConnectionState, MessageDirection
 from ._config import ConnectionLimits
 from ._errors import CodecError, QueueOverflow, ConnectionClosed, ProtocolViolation
+from ._values import InputId
 from ._messages import Message, ErrorEvent, ClientHello, ServerHello
 from ._protocol import ProtocolValidator, _TransitionResult
 
@@ -318,6 +319,23 @@ class _TransportCore:
     def discard_queued(self, predicate: Callable[[_OutboundBatch], bool]) -> tuple[_OutboundBatch, ...]:
         self._check_loop()
         return self._queue.discard(predicate)
+
+    def commit_input_audio(self, input_id: InputId, end_frame: int) -> None:
+        """Commit callback delivery and atomically queue any resulting close."""
+        self._check_loop()
+        if self._reader_task is None:
+            raise RuntimeError("transport core is not started")
+        if self._closing:
+            raise ConnectionClosed("transport core is closing")
+        previous = self._validator._data
+        try:
+            messages = self._validator._commit_input_audio(input_id, end_frame)
+            if messages:
+                frames = tuple(_encode_message_with_limits(message, self._limits) for message in messages)
+                self._queue.put_nowait(frames, lane=_QueueLane.CONTROL, weight=len(frames))
+        except BaseException:
+            self._validator._data = previous
+            raise
 
     async def close(self, code: int = 1000, *, drain: bool = False) -> None:
         self._check_loop()
