@@ -10,21 +10,38 @@ from collections.abc import Callable
 from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
 from websockets.asyncio.server import Server, ServerConnection
 
-from ._enums import EndpointRole
+from ._enums import (
+    ErrorCode,
+    ErrorScope,
+    CoarseState,
+    EndpointRole,
+    InputCloseReason,
+    ResponseCancelReason,
+    ConversationEndReason,
+)
 from ._config import ServerConfig
+from ._errors import ProtocolViolation
+from ._values import InputId, ConversationId
 from ._messages import (
     Message,
+    ErrorEvent,
+    StateEvent,
     InputAudioEvent,
+    InputClosedEvent,
     InputAbortedEvent,
     InputStartedEvent,
+    TranscriptFinalEvent,
     PlaybackFinishedEvent,
+    TranscriptUpdateEvent,
+    ConversationEndedEvent,
+    ResponseCancelledEvent,
     ConversationStartedEvent,
     PlaybackInterruptedEvent,
     ConversationCancelledEvent,
 )
-from ._protocol import _TransitionResult
+from ._protocol import _Input, _Response, _TransitionResult
 from ._handshake import _serve_websocket, _perform_server_handshake
-from ._transport import _TransportCore
+from ._transport import _QueueLane, _TransportCore
 
 _CONTROL_CAPACITY = 16
 
@@ -120,6 +137,7 @@ class ServerSession:
         self._handler_signals: asyncio.Queue[_HandlerSignal] = asyncio.Queue(maxsize=_CONTROL_CAPACITY)
         self._handler_signal_overflow = False
         self._dispatcher_task: asyncio.Task[None] | None = None
+        self._server_closed_inputs: set[InputId] = set()
 
     def _set_handler(self, handler: ServerHandler) -> None:
         self._check_loop()
@@ -132,6 +150,113 @@ class ServerSession:
         self._check_loop()
         if transition.dispatch and not self._events.put_nowait(message):
             self._record_handler_signal(_HandlerQueueFull(message))
+        if isinstance(message, InputStartedEvent):
+            self._enqueue_state(CoarseState.LISTENING)
+        elif isinstance(message, InputAbortedEvent):
+            self._enqueue_state(CoarseState.PROCESSING)
+        elif isinstance(message, ConversationCancelledEvent) and transition.dispatch:
+            self._end_cancelled_conversation(message)
+
+    async def close_input(self, input_id: InputId, reason: InputCloseReason) -> None:
+        self._check_loop()
+        conversation_id = self._require_conversation_id()
+        input_ = self._require_current_input(input_id)
+        close = InputClosedEvent(conversation_id, input_id, input_.committed_end_frame, reason)
+        state = self._next_state(CoarseState.PROCESSING)
+        self._enqueue_control((close,) if state is None else (close, state))
+        self._server_closed_inputs.add(input_id)
+
+    async def update_transcript(
+        self,
+        input_id: InputId,
+        revision: int,
+        text: str,
+        language: str | None = None,
+    ) -> None:
+        self._check_loop()
+        conversation_id = self._require_conversation_id()
+        self._enqueue_control((TranscriptUpdateEvent(conversation_id, input_id, revision, text, language),))
+
+    async def finalize_transcript(
+        self,
+        input_id: InputId,
+        text: str,
+        language: str | None = None,
+    ) -> None:
+        self._check_loop()
+        conversation_id = self._require_conversation_id()
+        self._enqueue_control((TranscriptFinalEvent(conversation_id, input_id, text, language),))
+
+    async def end_conversation(self, reason: ConversationEndReason) -> None:
+        self._check_loop()
+        conversation_id = self._require_conversation_id()
+        messages: list[Message] = []
+        closed_input_id: InputId | None = None
+        conversation = self._core.validator._data.conversation
+        assert conversation is not None
+        input_ = self._core.validator._current_input(self._core.validator._data, conversation)
+        if input_ is not None:
+            if input_.terminal is None:
+                messages.append(
+                    InputClosedEvent(
+                        conversation_id,
+                        input_.start.input_id,
+                        input_.committed_end_frame,
+                        InputCloseReason.FAILED,
+                    )
+                )
+                closed_input_id = input_.start.input_id
+            if input_.transcript_final is None:
+                messages.append(TranscriptFinalEvent(conversation_id, input_.start.input_id, ""))
+        messages.extend(self._active_response_terminals())
+        messages.append(ConversationEndedEvent(conversation_id, reason))
+        self._enqueue_control(tuple(messages))
+        if closed_input_id is not None:
+            self._server_closed_inputs.add(closed_input_id)
+        self._response_terminated()
+
+    async def fail(self, scope: ErrorScope, code: ErrorCode, message: str | None = None) -> None:
+        self._check_loop()
+        if not isinstance(scope, ErrorScope):
+            raise TypeError("scope must be ErrorScope")
+        if not isinstance(code, ErrorCode):
+            raise TypeError("code must be ErrorCode")
+        if scope is ErrorScope.CONNECTION:
+            self._enqueue_control((ErrorEvent(scope, code, True, message=message),))
+            await self._core.close(1002, drain=True)
+            return
+
+        conversation_id = self._require_conversation_id()
+        if scope is ErrorScope.CONVERSATION:
+            conversation = self._core.validator._data.conversation
+            assert conversation is not None
+            input_ = self._core.validator._current_input(self._core.validator._data, conversation)
+            event = ErrorEvent(scope, code, True, conversation_id, message=message)
+            self._enqueue_control((event,))
+            if input_ is not None and input_.terminal is None:
+                self._server_closed_inputs.add(input_.start.input_id)
+            self._response_terminated()
+            return
+        if scope is ErrorScope.INPUT:
+            input_ = self._require_recoverable_input()
+            event = ErrorEvent(scope, code, True, conversation_id, input_.start.input_id, message=message)
+            state = self._next_state(CoarseState.WAITING)
+            self._enqueue_control((event,) if state is None else (event, state))
+            self._server_closed_inputs.add(input_.start.input_id)
+            return
+
+        assert scope is ErrorScope.RESPONSE
+        response = self._require_live_response()
+        event = ErrorEvent(scope, code, True, conversation_id, response_id=response.start.response_id, message=message)
+        state = None
+        if not response.start.end_conversation and code in (
+            ErrorCode.GENERATION_FAILED,
+            ErrorCode.TTS_FAILED,
+            ErrorCode.OUTPUT_OVERFLOW,
+        ):
+            state = self._next_state(CoarseState.WAITING)
+        self._enqueue_control((event,) if state is None else (event, state))
+        self._response_terminated()
 
     async def _close_dispatcher(self) -> None:
         self._check_loop()
@@ -151,6 +276,8 @@ class ServerSession:
                 return
             try:
                 if isinstance(event, InputAudioEvent):
+                    if event.input_id in self._server_closed_inputs:
+                        continue
                     end_frame = event.start_frame + len(event.audio) // 2
                     self._core.commit_input_audio(event.input_id, end_frame)
                 await self._dispatch(event)
@@ -180,6 +307,83 @@ class ServerSession:
             self._handler_signals.put_nowait(signal)
         except asyncio.QueueFull:
             self._handler_signal_overflow = True
+
+    def _enqueue_control(self, messages: tuple[Message, ...]) -> None:
+        self._core.enqueue_batch(messages, lane=_QueueLane.CONTROL)
+
+    def _enqueue_state(self, state: CoarseState) -> None:
+        event = self._next_state(state)
+        if event is not None:
+            self._enqueue_control((event,))
+
+    def _next_state(self, state: CoarseState) -> StateEvent | None:
+        conversation = self._core.validator._data.conversation
+        if conversation is None:
+            raise ProtocolViolation("operation requires an open conversation")
+        previous = conversation.state
+        if previous is not None and previous.state is state:
+            return None
+        revision = 1 if previous is None else previous.revision + 1
+        return StateEvent(conversation.conversation_id, revision, state)
+
+    def _require_conversation_id(self) -> ConversationId:
+        conversation = self._core.validator._data.conversation
+        if conversation is None:
+            raise ProtocolViolation("operation requires an open conversation")
+        if conversation.cancel is not None or conversation.failure is not None:
+            raise ProtocolViolation("operation requires a live conversation")
+        return conversation.conversation_id
+
+    def _require_current_input(self, input_id: InputId) -> _Input:
+        conversation = self._core.validator._data.conversation
+        assert conversation is not None
+        input_ = self._core.validator._find_input(self._core.validator._data, input_id)
+        if input_ is None or input_.start.conversation_id != conversation.conversation_id:
+            raise ProtocolViolation("operation targets no input in the open conversation")
+        if conversation.input_id != input_id:
+            raise ProtocolViolation("operation requires the current input")
+        return input_
+
+    def _require_recoverable_input(self) -> _Input:
+        conversation = self._core.validator._data.conversation
+        assert conversation is not None
+        input_ = self._core.validator._current_input(self._core.validator._data, conversation)
+        if input_ is None or input_.response_id is not None or input_.failure is not None:
+            raise ProtocolViolation("input failure requires one current recoverable input")
+        return input_
+
+    def _require_live_response(self) -> _Response:
+        conversation = self._core.validator._data.conversation
+        assert conversation is not None
+        response = self._core.validator._current_response(self._core.validator._data, conversation)
+        if response is None or response.terminal is not None or response.failure is not None:
+            raise ProtocolViolation("response failure requires one current live response")
+        return response
+
+    def _active_response_terminals(self) -> tuple[Message, ...]:
+        conversation = self._core.validator._data.conversation
+        assert conversation is not None
+        response = self._core.validator._current_response(self._core.validator._data, conversation)
+        if response is None:
+            return ()
+        return (
+            ResponseCancelledEvent(
+                conversation.conversation_id,
+                response.start.response_id,
+                ResponseCancelReason.CONVERSATION_CANCELLED,
+            ),
+        )
+
+    def _end_cancelled_conversation(self, message: ConversationCancelledEvent) -> None:
+        messages = (
+            *self._active_response_terminals(),
+            ConversationEndedEvent(message.conversation_id, ConversationEndReason.CANCELLED),
+        )
+        self._enqueue_control(messages)
+        self._response_terminated()
+
+    def _response_terminated(self) -> None:
+        """Hook for task 16 writer invalidation and producer cancellation."""
 
     def _check_loop(self) -> None:
         try:
