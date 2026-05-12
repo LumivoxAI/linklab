@@ -84,6 +84,22 @@ async def send_message(connection: Any, message: linklab.Message) -> None:
     await connection.send(linklab.encode_message(message))
 
 
+async def receive_messages(handshake: Any, count: int) -> list[linklab.Message]:
+    messages: list[linklab.Message] = []
+    async with asyncio.timeout(1):
+        for _ in range(count):
+            frame = await handshake.connection.recv()
+            assert type(frame) is bytes
+            messages.append(
+                linklab.decode_message(
+                    frame,
+                    direction=linklab.MessageDirection.SERVER_TO_CLIENT,
+                    limits=handshake.server_hello.limits,
+                )
+            )
+    return messages
+
+
 def test_server_binds_returns_and_isolates_sessions_and_handlers() -> None:
     async def scenario() -> None:
         config = server_config(max_connections=2)
@@ -466,6 +482,325 @@ def test_server_session_rejects_use_from_another_event_loop() -> None:
     async def wrong_loop() -> None:
         with pytest.raises(RuntimeError, match="different event loop"):
             await retained[0]._close_dispatcher()
+        with pytest.raises(RuntimeError, match="different event loop"):
+            await retained[0].end_conversation(linklab.ConversationEndReason.CANCELLED)
 
     run(create_session())
     run(wrong_loop())
+
+
+def test_session_closes_at_callback_boundary_and_orders_transcripts_and_state() -> None:
+    class ClosingHandler(RecordingHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.closed = asyncio.Event()
+
+        async def on_input_audio(self, session: linklab.ServerSession, event: linklab.InputAudioEvent) -> None:
+            self.events.append(event)
+            await session.update_transcript(event.input_id, 1, "hello", "en")
+            before = session._core.validator._data
+            with pytest.raises(linklab.ProtocolViolation, match="revision"):
+                await session.update_transcript(event.input_id, 3, "skipped")
+            assert session._core.validator._data == before
+            await session.close_input(event.input_id, linklab.InputCloseReason.ENDPOINT)
+            await session.finalize_transcript(event.input_id, "hello", "en")
+            self.closed.set()
+
+    async def scenario() -> None:
+        config = server_config()
+        sessions: list[linklab.ServerSession] = []
+        handler = ClosingHandler()
+
+        def factory(session: linklab.ServerSession) -> ClosingHandler:
+            sessions.append(session)
+            return handler
+
+        server = linklab.VoiceServer(config, factory, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+        await send_message(client.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await send_message(
+            client.connection,
+            linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0),
+        )
+        await send_message(client.connection, linklab.InputAudioEvent(conversation_id, input_id, 0, True, b"\0" * 4))
+        await send_message(client.connection, linklab.InputAudioEvent(conversation_id, input_id, 2, True, b"\0" * 4))
+        await handler.closed.wait()
+
+        messages = await receive_messages(client, 5)
+        assert messages == [
+            linklab.StateEvent(conversation_id, 1, linklab.CoarseState.LISTENING),
+            linklab.TranscriptUpdateEvent(conversation_id, input_id, 1, "hello", "en"),
+            linklab.InputClosedEvent(conversation_id, input_id, 2, linklab.InputCloseReason.ENDPOINT),
+            linklab.StateEvent(conversation_id, 2, linklab.CoarseState.PROCESSING),
+            linklab.TranscriptFinalEvent(conversation_id, input_id, "hello", "en"),
+        ]
+        await asyncio.sleep(0)
+        assert [event.type for event in cast(list[linklab.Message], handler.events)] == [
+            "conversation.start",
+            "input.start",
+            "input.audio",
+        ]
+
+        session = sessions[0]
+        await session.end_conversation(linklab.ConversationEndReason.COMPLETED)
+        assert await receive_messages(client, 1) == [
+            linklab.ConversationEndedEvent(conversation_id, linklab.ConversationEndReason.COMPLETED)
+        ]
+        with pytest.raises(linklab.ProtocolViolation, match="open conversation"):
+            await session.finalize_transcript(input_id, "late")
+
+        await client.connection.close()
+        await server.close()
+
+    run(scenario())
+
+
+def test_input_fail_after_close_emits_exact_recovery_batch_and_rejects_repeat() -> None:
+    async def scenario() -> None:
+        config = server_config()
+        sessions: list[linklab.ServerSession] = []
+
+        def factory(session: linklab.ServerSession) -> RecordingHandler:
+            sessions.append(session)
+            return RecordingHandler()
+
+        server = linklab.VoiceServer(config, factory, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        await wait_for_count(cast(list[object], sessions), 1)
+        session = sessions[0]
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+        await send_message(client.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await send_message(
+            client.connection,
+            linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0),
+        )
+        async with asyncio.timeout(1):
+            while session._core.validator.state.input_id != input_id:
+                await asyncio.sleep(0)
+
+        before = session._core.validator._data
+        with pytest.raises(linklab.ProtocolViolation, match="no input"):
+            await session.close_input(linklab.InputId(2), linklab.InputCloseReason.NO_SPEECH)
+        assert session._core.validator._data == before
+        await session.close_input(input_id, linklab.InputCloseReason.NO_SPEECH)
+        await session.fail(linklab.ErrorScope.INPUT, linklab.ErrorCode.STT_FAILED, "stt unavailable")
+        messages = await receive_messages(client, 6)
+        assert messages == [
+            linklab.StateEvent(conversation_id, 1, linklab.CoarseState.LISTENING),
+            linklab.InputClosedEvent(conversation_id, input_id, 0, linklab.InputCloseReason.NO_SPEECH),
+            linklab.StateEvent(conversation_id, 2, linklab.CoarseState.PROCESSING),
+            linklab.ErrorEvent(
+                linklab.ErrorScope.INPUT,
+                linklab.ErrorCode.STT_FAILED,
+                True,
+                conversation_id,
+                input_id,
+                message="stt unavailable",
+            ),
+            linklab.TranscriptFinalEvent(conversation_id, input_id, ""),
+            linklab.StateEvent(conversation_id, 3, linklab.CoarseState.WAITING),
+        ]
+
+        before = session._core.validator._data
+        with pytest.raises(linklab.ProtocolViolation, match="recoverable input"):
+            await session.fail(linklab.ErrorScope.INPUT, linklab.ErrorCode.STT_FAILED)
+        assert session._core.validator._data == before
+        with pytest.raises(linklab.ProtocolViolation, match="live response"):
+            await session.fail(linklab.ErrorScope.RESPONSE, linklab.ErrorCode.GENERATION_FAILED)
+
+        await client.connection.close()
+        await server.close()
+
+    run(scenario())
+
+
+def test_end_open_input_and_client_cancel_emit_terminal_batches() -> None:
+    async def server_end() -> None:
+        config = server_config()
+        sessions: list[linklab.ServerSession] = []
+
+        def factory(session: linklab.ServerSession) -> RecordingHandler:
+            sessions.append(session)
+            return RecordingHandler()
+
+        server = linklab.VoiceServer(config, factory, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        await wait_for_count(cast(list[object], sessions), 1)
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+        await send_message(client.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await send_message(
+            client.connection,
+            linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0),
+        )
+        async with asyncio.timeout(1):
+            while sessions[0]._core.validator.state.input_id != input_id:
+                await asyncio.sleep(0)
+        await sessions[0].end_conversation(linklab.ConversationEndReason.CANCELLED)
+        assert await receive_messages(client, 4) == [
+            linklab.StateEvent(conversation_id, 1, linklab.CoarseState.LISTENING),
+            linklab.InputClosedEvent(conversation_id, input_id, 0, linklab.InputCloseReason.FAILED),
+            linklab.TranscriptFinalEvent(conversation_id, input_id, ""),
+            linklab.ConversationEndedEvent(conversation_id, linklab.ConversationEndReason.CANCELLED),
+        ]
+        await client.connection.close()
+        await server.close()
+
+    async def client_cancel() -> None:
+        config = server_config()
+        handler = RecordingHandler()
+        server = linklab.VoiceServer(config, lambda _session: handler, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+        await send_message(client.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await send_message(
+            client.connection,
+            linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0),
+        )
+        await send_message(
+            client.connection,
+            linklab.ConversationCancelledEvent(conversation_id, linklab.ConversationCancelReason.USER),
+        )
+        assert await receive_messages(client, 2) == [
+            linklab.StateEvent(conversation_id, 1, linklab.CoarseState.LISTENING),
+            linklab.ConversationEndedEvent(conversation_id, linklab.ConversationEndReason.CANCELLED),
+        ]
+        await wait_for_count(handler.events, 3)
+        assert isinstance(handler.events[-1], linklab.ConversationCancelledEvent)
+        await client.connection.close()
+        await server.close()
+
+    run(server_end())
+    run(client_cancel())
+
+
+def test_session_fail_resolves_connection_conversation_and_response_scopes() -> None:
+    async def conversation_failure() -> None:
+        config = server_config()
+        sessions: list[linklab.ServerSession] = []
+
+        def factory(session: linklab.ServerSession) -> RecordingHandler:
+            sessions.append(session)
+            return RecordingHandler()
+
+        server = linklab.VoiceServer(config, factory, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        await wait_for_count(cast(list[object], sessions), 1)
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+        await send_message(client.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await send_message(
+            client.connection,
+            linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0),
+        )
+        async with asyncio.timeout(1):
+            while sessions[0]._core.validator.state.input_id != input_id:
+                await asyncio.sleep(0)
+        await sessions[0].fail(
+            linklab.ErrorScope.CONVERSATION,
+            linklab.ErrorCode.CONVERSATION_FAILED,
+            "pipeline failed",
+        )
+        assert await receive_messages(client, 5) == [
+            linklab.StateEvent(conversation_id, 1, linklab.CoarseState.LISTENING),
+            linklab.ErrorEvent(
+                linklab.ErrorScope.CONVERSATION,
+                linklab.ErrorCode.CONVERSATION_FAILED,
+                True,
+                conversation_id,
+                message="pipeline failed",
+            ),
+            linklab.InputClosedEvent(conversation_id, input_id, 0, linklab.InputCloseReason.FAILED),
+            linklab.TranscriptFinalEvent(conversation_id, input_id, ""),
+            linklab.ConversationEndedEvent(conversation_id, linklab.ConversationEndReason.SERVER_FAILED),
+        ]
+        await client.connection.close()
+        await server.close()
+
+    async def response_failure() -> None:
+        config = server_config()
+        sessions: list[linklab.ServerSession] = []
+
+        def factory(session: linklab.ServerSession) -> RecordingHandler:
+            sessions.append(session)
+            return RecordingHandler()
+
+        server = linklab.VoiceServer(config, factory, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        await wait_for_count(cast(list[object], sessions), 1)
+        session = sessions[0]
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+        response_id = linklab.ResponseId(1)
+        await send_message(client.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await send_message(
+            client.connection,
+            linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0),
+        )
+        async with asyncio.timeout(1):
+            while session._core.validator.state.input_id != input_id:
+                await asyncio.sleep(0)
+        await session.close_input(input_id, linklab.InputCloseReason.NO_SPEECH)
+        await session.finalize_transcript(input_id, "")
+        session._core.enqueue_batch(
+            (linklab.ResponseStartedEvent(conversation_id, response_id, input_id, False),),
+            lane=_QueueLane.CONTROL,
+        )
+        await session.fail(linklab.ErrorScope.RESPONSE, linklab.ErrorCode.GENERATION_FAILED)
+        messages = await receive_messages(client, 8)
+        assert messages[-3:] == [
+            linklab.ErrorEvent(
+                linklab.ErrorScope.RESPONSE,
+                linklab.ErrorCode.GENERATION_FAILED,
+                True,
+                conversation_id,
+                response_id=response_id,
+            ),
+            linklab.ResponseCancelledEvent(
+                conversation_id,
+                response_id,
+                linklab.ResponseCancelReason.GENERATION_FAILED,
+            ),
+            linklab.StateEvent(conversation_id, 3, linklab.CoarseState.WAITING),
+        ]
+        await client.connection.close()
+        await server.close()
+
+    async def connection_failure() -> None:
+        config = server_config()
+        sessions: list[linklab.ServerSession] = []
+
+        def factory(session: linklab.ServerSession) -> RecordingHandler:
+            sessions.append(session)
+            return RecordingHandler()
+
+        server = linklab.VoiceServer(config, factory, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        await wait_for_count(cast(list[object], sessions), 1)
+        await sessions[0].fail(linklab.ErrorScope.CONNECTION, linklab.ErrorCode.PROTOCOL_STATE, "local failure")
+        assert await receive_messages(client, 1) == [
+            linklab.ErrorEvent(
+                linklab.ErrorScope.CONNECTION,
+                linklab.ErrorCode.PROTOCOL_STATE,
+                True,
+                message="local failure",
+            )
+        ]
+        await client.connection.wait_closed()
+        assert client.connection.close_code == 1002
+        await server.close()
+
+    run(conversation_failure())
+    run(response_failure())
+    run(connection_failure())
