@@ -16,12 +16,13 @@ from ._enums import (
     CoarseState,
     EndpointRole,
     InputCloseReason,
+    ProtocolObjectKind,
     ResponseCancelReason,
     ConversationEndReason,
 )
 from ._config import ServerConfig
-from ._errors import ProtocolViolation
-from ._values import InputId, ConversationId
+from ._errors import WriterClosed, ProtocolViolation
+from ._values import InputId, ResponseId, ConversationId
 from ._messages import (
     Message,
     ErrorEvent,
@@ -30,11 +31,15 @@ from ._messages import (
     InputClosedEvent,
     InputAbortedEvent,
     InputStartedEvent,
+    ResponseEndedEvent,
+    ResponseStartedEvent,
     TranscriptFinalEvent,
     PlaybackFinishedEvent,
     TranscriptUpdateEvent,
     ConversationEndedEvent,
     ResponseCancelledEvent,
+    ResponseTextDeltaEvent,
+    ResponseTextFinalEvent,
     ConversationStartedEvent,
     PlaybackInterruptedEvent,
     ConversationCancelledEvent,
@@ -77,6 +82,124 @@ class _HandlerRaised:
 
 
 type _HandlerSignal = _HandlerQueueFull | _HandlerRaised
+
+
+class ResponseWriter:
+    def __init__(self, session: ServerSession, response_id: ResponseId) -> None:
+        self._session = session
+        self._response_id = response_id
+        self._next_text_sequence = 0
+        self._closed = False
+
+    @property
+    def response_id(self) -> ResponseId:
+        return self._response_id
+
+    async def send_text_delta(self, text: str) -> None:
+        self._require_open()
+        conversation_id = self._session._require_conversation_id()
+        event = ResponseTextDeltaEvent(conversation_id, self._response_id, self._next_text_sequence, text)
+        self._session._enqueue_control((event,))
+        self._next_text_sequence += 1
+
+    async def finalize_text(self, text: str) -> None:
+        self._require_open()
+        conversation_id = self._session._require_conversation_id()
+        self._session._enqueue_control((ResponseTextFinalEvent(conversation_id, self._response_id, text),))
+
+    async def finish(self) -> None:
+        self._require_open()
+        conversation_id = self._session._require_conversation_id()
+        response = self._session._require_writer_response(self)
+        messages: list[Message] = [ResponseEndedEvent(conversation_id, self._response_id)]
+        if response.start.end_conversation:
+            messages.append(ConversationEndedEvent(conversation_id, ConversationEndReason.COMPLETED))
+        else:
+            state = self._session._next_state(CoarseState.WAITING)
+            if state is not None:
+                messages.append(state)
+        self._session._enqueue_control(tuple(messages))
+        self._session._response_terminated()
+
+    async def cancel(self, reason: ResponseCancelReason) -> None:
+        self._require_open()
+        if not isinstance(reason, ResponseCancelReason):
+            raise TypeError("reason must be ResponseCancelReason")
+        if reason not in (
+            ResponseCancelReason.GENERATION_FAILED,
+            ResponseCancelReason.TTS_FAILED,
+            ResponseCancelReason.OVERFLOW,
+            ResponseCancelReason.SHUTDOWN,
+        ):
+            raise ProtocolViolation("response cancellation reason is owned by peer or session logic")
+
+        conversation_id = self._session._require_conversation_id()
+        response = self._session._require_writer_response(self)
+        if reason is ResponseCancelReason.OVERFLOW and response.output is None:
+            raise ProtocolViolation("overflow cancellation requires a started output")
+
+        messages: list[Message]
+        if reason in (ResponseCancelReason.GENERATION_FAILED, ResponseCancelReason.TTS_FAILED):
+            code = (
+                ErrorCode.GENERATION_FAILED
+                if reason is ResponseCancelReason.GENERATION_FAILED
+                else ErrorCode.TTS_FAILED
+            )
+            messages = [
+                ErrorEvent(
+                    ErrorScope.RESPONSE,
+                    code,
+                    True,
+                    conversation_id,
+                    response_id=self._response_id,
+                )
+            ]
+            if not response.start.end_conversation:
+                state = self._session._next_state(CoarseState.WAITING)
+                if state is not None:
+                    messages.append(state)
+        elif reason is ResponseCancelReason.SHUTDOWN:
+            messages = [
+                ResponseCancelledEvent(conversation_id, self._response_id, reason),
+                ConversationEndedEvent(conversation_id, ConversationEndReason.CANCELLED),
+            ]
+        else:
+            messages = [
+                ErrorEvent(
+                    ErrorScope.RESPONSE,
+                    ErrorCode.OUTPUT_OVERFLOW,
+                    True,
+                    conversation_id,
+                    response_id=self._response_id,
+                )
+            ]
+            if not response.start.end_conversation:
+                state = self._session._next_state(CoarseState.WAITING)
+                if state is not None:
+                    messages.append(state)
+
+        self._session._enqueue_control(tuple(messages))
+        self._session._response_terminated()
+
+    async def __aenter__(self) -> Self:
+        self._require_open()
+        return self
+
+    async def __aexit__(self, exc_type: object, _exc: object, _traceback: object) -> bool:
+        if exc_type is None:
+            await self.finish()
+        elif not self._closed:
+            await self.cancel(ResponseCancelReason.GENERATION_FAILED)
+        return False
+
+    def _require_open(self) -> None:
+        self._session._check_loop()
+        if self._closed or self._session._response_writer is not self:
+            raise WriterClosed("response writer is closed")
+        self._session._require_writer_response(self)
+
+    def _close(self) -> None:
+        self._closed = True
 
 
 class _HandlerQueue:
@@ -138,6 +261,7 @@ class ServerSession:
         self._handler_signal_overflow = False
         self._dispatcher_task: asyncio.Task[None] | None = None
         self._server_closed_inputs: set[InputId] = set()
+        self._response_writer: ResponseWriter | None = None
 
     def _set_handler(self, handler: ServerHandler) -> None:
         self._check_loop()
@@ -148,6 +272,8 @@ class ServerSession:
 
     def _accept_inbound(self, message: Message, transition: _TransitionResult) -> None:
         self._check_loop()
+        if ProtocolObjectKind.RESPONSE in transition.cancellation_targets:
+            self._response_terminated()
         if transition.dispatch and not self._events.put_nowait(message):
             self._record_handler_signal(_HandlerQueueFull(message))
         if isinstance(message, InputStartedEvent):
@@ -186,6 +312,20 @@ class ServerSession:
         self._check_loop()
         conversation_id = self._require_conversation_id()
         self._enqueue_control((TranscriptFinalEvent(conversation_id, input_id, text, language),))
+
+    async def start_response(self, input_id: InputId, *, end_conversation: bool = False) -> ResponseWriter:
+        self._check_loop()
+        conversation_id = self._require_conversation_id()
+        if not self._core.validator._response_input_ready(input_id):
+            raise ProtocolViolation("response requires the current finalized terminal input")
+        response_value, _ = self._core.validator._data.response_ids.allocate()
+        response_id = ResponseId(response_value)
+        start = ResponseStartedEvent(conversation_id, response_id, input_id, end_conversation)
+        state = self._next_state(CoarseState.RESPONDING)
+        self._enqueue_control((start,) if state is None else (start, state))
+        writer = ResponseWriter(self, response_id)
+        self._response_writer = writer
+        return writer
 
     async def end_conversation(self, reason: ConversationEndReason) -> None:
         self._check_loop()
@@ -260,6 +400,7 @@ class ServerSession:
 
     async def _close_dispatcher(self) -> None:
         self._check_loop()
+        self._response_terminated()
         self._events.close()
         task = self._dispatcher_task
         if task is not None and task is not asyncio.current_task() and not task.done():
@@ -360,6 +501,21 @@ class ServerSession:
             raise ProtocolViolation("response failure requires one current live response")
         return response
 
+    def _require_writer_response(self, writer: ResponseWriter) -> _Response:
+        if self._response_writer is not writer:
+            raise WriterClosed("response writer is closed")
+        try:
+            response = self._require_live_response()
+        except ProtocolViolation as error:
+            writer._close()
+            self._response_writer = None
+            raise WriterClosed("response writer is closed") from error
+        if response.start.response_id != writer.response_id:
+            writer._close()
+            self._response_writer = None
+            raise WriterClosed("response writer is stale")
+        return response
+
     def _active_response_terminals(self) -> tuple[Message, ...]:
         conversation = self._core.validator._data.conversation
         assert conversation is not None
@@ -383,7 +539,10 @@ class ServerSession:
         self._response_terminated()
 
     def _response_terminated(self) -> None:
-        """Hook for task 16 writer invalidation and producer cancellation."""
+        writer = self._response_writer
+        if writer is not None:
+            writer._close()
+            self._response_writer = None
 
     def _check_loop(self) -> None:
         try:
