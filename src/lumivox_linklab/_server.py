@@ -21,16 +21,19 @@ from ._enums import (
     ConversationEndReason,
 )
 from ._config import ServerConfig
-from ._errors import WriterClosed, ProtocolViolation
-from ._values import InputId, ResponseId, ConversationId
+from ._errors import WriterClosed, QueueOverflow, ProtocolViolation
+from ._values import InputId, OutputId, ResponseId, ConversationId, ReadableBuffer
 from ._messages import (
     Message,
     ErrorEvent,
     StateEvent,
     InputAudioEvent,
     InputClosedEvent,
+    OutputAudioEvent,
+    OutputEndedEvent,
     InputAbortedEvent,
     InputStartedEvent,
+    OutputStartedEvent,
     ResponseEndedEvent,
     ResponseStartedEvent,
     TranscriptFinalEvent,
@@ -89,6 +92,7 @@ class ResponseWriter:
         self._session = session
         self._response_id = response_id
         self._next_text_sequence = 0
+        self._output_writer: OutputWriter | None = None
         self._closed = False
 
     @property
@@ -107,12 +111,28 @@ class ResponseWriter:
         conversation_id = self._session._require_conversation_id()
         self._session._enqueue_control((ResponseTextFinalEvent(conversation_id, self._response_id, text),))
 
+    async def start_output(self) -> OutputWriter:
+        self._require_open()
+        conversation_id = self._session._require_conversation_id()
+        response = self._session._require_writer_response(self)
+        if response.output is not None or self._output_writer is not None:
+            raise ProtocolViolation("response may have at most one output")
+        output_value, _ = self._session._core.validator._data.output_ids.allocate()
+        output_id = OutputId(output_value)
+        self._session._enqueue_control((OutputStartedEvent(conversation_id, self._response_id, output_id),))
+        writer = OutputWriter(self, output_id)
+        self._output_writer = writer
+        return writer
+
     async def finish(self) -> None:
         self._require_open()
         conversation_id = self._session._require_conversation_id()
         response = self._session._require_writer_response(self)
         messages: list[Message] = [ResponseEndedEvent(conversation_id, self._response_id)]
-        if response.start.end_conversation:
+        if response.output is not None:
+            if response.output.terminal is None:
+                raise ProtocolViolation("response cannot finish before its output")
+        elif response.start.end_conversation:
             messages.append(ConversationEndedEvent(conversation_id, ConversationEndReason.COMPLETED))
         else:
             state = self._session._next_state(CoarseState.WAITING)
@@ -137,6 +157,10 @@ class ResponseWriter:
         response = self._session._require_writer_response(self)
         if reason is ResponseCancelReason.OVERFLOW and response.output is None:
             raise ProtocolViolation("overflow cancellation requires a started output")
+
+        output_writer = self._output_writer
+        if output_writer is not None:
+            output_writer._discard_queued()
 
         messages: list[Message]
         if reason in (ResponseCancelReason.GENERATION_FAILED, ResponseCancelReason.TTS_FAILED):
@@ -200,6 +224,118 @@ class ResponseWriter:
 
     def _close(self) -> None:
         self._closed = True
+        if self._output_writer is not None:
+            self._output_writer._close()
+
+
+class OutputWriter:
+    def __init__(self, response_writer: ResponseWriter, output_id: OutputId) -> None:
+        self._response_writer = response_writer
+        self._session = response_writer._session
+        self._output_id = output_id
+        self._next_frame = 0
+        self._closed = False
+
+    @property
+    def output_id(self) -> OutputId:
+        return self._output_id
+
+    async def send_audio(self, audio: ReadableBuffer) -> None:
+        self._require_open()
+        pcm = _copy_output_pcm(audio)
+        conversation_id = self._session._require_conversation_id()
+        limits = self._session._core.validator._data.server_hello
+        if limits is None:
+            raise ProtocolViolation("output audio requires negotiated limits")
+        max_frames = limits.limits.max_output_audio_frames
+        frame_count = len(pcm) // 2
+        events = tuple(
+            OutputAudioEvent(
+                conversation_id,
+                self._response_writer.response_id,
+                self._output_id,
+                self._next_frame + offset,
+                pcm[offset * 2 : min(offset + max_frames, frame_count) * 2],
+            )
+            for offset in range(0, frame_count, max_frames)
+        )
+        try:
+            self._session._core.enqueue_batch(
+                events,
+                lane=_QueueLane.DATA,
+                weight=frame_count,
+                tag=self,
+            )
+        except QueueOverflow:
+            self._discard_queued()
+            await self._response_writer.cancel(ResponseCancelReason.OVERFLOW)
+            raise
+        self._next_frame += frame_count
+
+    async def finish(self) -> None:
+        self._require_open()
+        if self._next_frame == 0:
+            raise ProtocolViolation("output must contain at least one audio frame")
+        conversation_id = self._session._require_conversation_id()
+        self._session._enqueue_control(
+            (
+                OutputEndedEvent(
+                    conversation_id,
+                    self._response_writer.response_id,
+                    self._output_id,
+                    self._next_frame,
+                ),
+            )
+        )
+        self._close()
+
+    async def __aenter__(self) -> Self:
+        self._require_open()
+        return self
+
+    async def __aexit__(self, exc_type: object, _exc: object, _traceback: object) -> bool:
+        if exc_type is None:
+            await self.finish()
+        elif not self._closed:
+            await self._response_writer.cancel(ResponseCancelReason.TTS_FAILED)
+        return False
+
+    def _require_open(self) -> None:
+        self._session._check_loop()
+        if self._closed or self._response_writer._output_writer is not self:
+            raise WriterClosed("output writer is closed")
+        response = self._session._require_writer_response(self._response_writer)
+        if (
+            response.output is None
+            or response.output.start.output_id != self._output_id
+            or response.output.terminal is not None
+        ):
+            self._close()
+            raise WriterClosed("output writer is stale")
+
+    def _discard_queued(self) -> None:
+        self._session._core.discard_queued(lambda batch: batch.tag is self)
+
+    def _close(self) -> None:
+        self._closed = True
+
+
+def _copy_output_pcm(audio: ReadableBuffer) -> bytes:
+    try:
+        view = memoryview(audio)
+    except TypeError as error:
+        raise TypeError("audio must support the buffer protocol") from error
+    if not view.contiguous:
+        raise ValueError("audio must be contiguous")
+    try:
+        pcm = view.cast("B").tobytes()
+    except TypeError as error:
+        raise ValueError("audio must be a contiguous byte-addressable buffer") from error
+    if not pcm:
+        raise ValueError("audio must not be empty")
+    if len(pcm) % 2:
+        raise ValueError("audio must contain frame-aligned PCM S16LE")
+    return pcm
 
 
 class _HandlerQueue:

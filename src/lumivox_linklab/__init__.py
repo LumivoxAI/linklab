@@ -20,7 +20,7 @@ from ._enums import (
 from ._client import VoiceClient, ClientCallbacks
 from ._config import AudioFormat, ClientConfig, ServerConfig, ConnectionLimits
 from ._errors import CodecError, LinklabError, WriterClosed, QueueOverflow, ConnectionClosed, ProtocolViolation
-from ._server import VoiceServer, ServerHandler, ServerSession, ResponseWriter
+from ._server import VoiceServer, OutputWriter, ServerHandler, ServerSession, ResponseWriter
 from ._values import (
     InputId,
     OutputId,
@@ -100,6 +100,7 @@ __all__ = [
     "MessageDirection",
     "Message",
     "OutputId",
+    "OutputWriter",
     "OutputAudioEvent",
     "OutputEndedEvent",
     "OutputStartedEvent",
