@@ -55,9 +55,11 @@ class Handler:
         pass
 
 
-async def open_ready_session() -> tuple[Any, Any, linklab.ServerSession, linklab.ConversationId, linklab.InputId]:
+async def open_ready_session(
+    *, output_queue_ms: int = 500
+) -> tuple[Any, Any, linklab.ServerSession, linklab.ConversationId, linklab.InputId]:
     port = unused_port()
-    config = linklab.ServerConfig(port=port, output_formats=(PCM_16K,))
+    config = linklab.ServerConfig(port=port, output_formats=(PCM_16K,), output_queue_ms=output_queue_ms)
     sessions: list[linklab.ServerSession] = []
 
     def factory(session: linklab.ServerSession) -> Handler:
@@ -246,6 +248,216 @@ def test_invalid_cancel_id_exhaustion_and_external_invalidation_are_atomic() -> 
         await receive_messages(client, 4)
         await close_pair(server, client)
 
+    async def output_id_exhausted() -> None:
+        server, client, session, _, input_id = await open_ready_session()
+        writer = await session.start_response(input_id)
+        data = session._core.validator._data
+        session._core.validator._data = replace(data, output_ids=_IdAllocator(4_294_967_296))
+        before = session._core.validator._data
+        with pytest.raises(linklab.ProtocolViolation, match="id_exhausted"):
+            await writer.start_output()
+        assert session._core.validator._data == before
+        await writer.cancel(linklab.ResponseCancelReason.SHUTDOWN)
+        await receive_messages(client, 4)
+        await close_pair(server, client)
+
     run(invalid_cancel())
     run(exhausted())
+    run(externally_ended())
+    run(output_id_exhausted())
+
+
+def test_output_writer_copies_splits_and_finishes_before_response() -> None:
+    async def scenario() -> None:
+        server, client, session, conversation_id, input_id = await open_ready_session()
+        response = await session.start_response(input_id)
+        output = await response.start_output()
+        assert output.output_id == linklab.OutputId(1)
+        with pytest.raises(AttributeError):
+            output.output_id = linklab.OutputId(2)  # type: ignore[misc]
+
+        pcm = bytearray(b"\x01\x02" * 1_601)
+        await output.send_audio(pcm)
+        pcm[:] = b"\xff" * len(pcm)
+
+        initial = await receive_messages(client, 5)
+        assert initial == [
+            linklab.ResponseStartedEvent(conversation_id, linklab.ResponseId(1), input_id, False),
+            linklab.StateEvent(conversation_id, 3, linklab.CoarseState.RESPONDING),
+            linklab.OutputStartedEvent(conversation_id, linklab.ResponseId(1), linklab.OutputId(1)),
+            linklab.OutputAudioEvent(
+                conversation_id,
+                linklab.ResponseId(1),
+                linklab.OutputId(1),
+                0,
+                b"\x01\x02" * 1_600,
+            ),
+            linklab.OutputAudioEvent(
+                conversation_id,
+                linklab.ResponseId(1),
+                linklab.OutputId(1),
+                1_600,
+                b"\x01\x02",
+            ),
+        ]
+
+        with pytest.raises(linklab.ProtocolViolation, match="before its output"):
+            await response.finish()
+        await output.finish()
+        await response.finish()
+        assert await receive_messages(client, 2) == [
+            linklab.OutputEndedEvent(
+                conversation_id,
+                linklab.ResponseId(1),
+                linklab.OutputId(1),
+                1_601,
+            ),
+            linklab.ResponseEndedEvent(conversation_id, linklab.ResponseId(1)),
+        ]
+        with pytest.raises(linklab.WriterClosed):
+            await output.send_audio(b"\x00\x00")
+        await close_pair(server, client)
+
+    run(scenario())
+
+
+def test_output_writer_rejects_invalid_and_empty_audio_without_mutation() -> None:
+    async def scenario() -> None:
+        server, client, session, _, input_id = await open_ready_session()
+        response = await session.start_response(input_id)
+        output = await response.start_output()
+        before = session._core.validator._data
+
+        with pytest.raises(ValueError, match="must not be empty"):
+            await output.send_audio(b"")
+        with pytest.raises(ValueError, match="frame-aligned"):
+            await output.send_audio(b"\x00")
+        source = memoryview(bytearray(8))[::2]
+        with pytest.raises(ValueError, match="contiguous"):
+            await output.send_audio(source)
+        with pytest.raises(linklab.ProtocolViolation, match="at least one"):
+            await output.finish()
+        assert session._core.validator._data == before
+
+        await response.cancel(linklab.ResponseCancelReason.TTS_FAILED)
+        await receive_messages(client, 6)
+        await close_pair(server, client)
+
+    run(scenario())
+
+
+def test_output_backpressure_rejects_whole_chunk_and_commits_terminal_batch() -> None:
+    async def scenario() -> None:
+        server, client, session, conversation_id, input_id = await open_ready_session(output_queue_ms=10)
+        response = await session.start_response(input_id)
+        output = await response.start_output()
+        await output.send_audio(b"\x00\x00" * 160)
+        data_snapshot, _ = session._core.snapshots()
+        assert (data_snapshot.capacity, data_snapshot.occupancy, data_snapshot.occupancy_unit) == (160, 160, "frames")
+
+        with pytest.raises(linklab.QueueOverflow):
+            await output.send_audio(b"\x01\x02")
+        data_snapshot, _ = session._core.snapshots()
+        assert data_snapshot.occupancy == 0
+        assert data_snapshot.overflow_count == 1
+        with pytest.raises(linklab.WriterClosed):
+            await output.finish()
+        with pytest.raises(linklab.WriterClosed):
+            await response.finish()
+
+        response_id = linklab.ResponseId(1)
+        assert await receive_messages(client, 6) == [
+            linklab.ResponseStartedEvent(conversation_id, response_id, input_id, False),
+            linklab.StateEvent(conversation_id, 3, linklab.CoarseState.RESPONDING),
+            linklab.OutputStartedEvent(conversation_id, response_id, linklab.OutputId(1)),
+            linklab.ErrorEvent(
+                linklab.ErrorScope.RESPONSE,
+                linklab.ErrorCode.OUTPUT_OVERFLOW,
+                True,
+                conversation_id,
+                response_id=response_id,
+            ),
+            linklab.ResponseCancelledEvent(conversation_id, response_id, linklab.ResponseCancelReason.OVERFLOW),
+            linklab.StateEvent(conversation_id, 4, linklab.CoarseState.WAITING),
+        ]
+        await close_pair(server, client)
+
+    run(scenario())
+
+
+def test_output_context_manager_normal_and_exceptional_exit() -> None:
+    async def normal() -> None:
+        server, client, session, conversation_id, input_id = await open_ready_session()
+        async with await session.start_response(input_id) as response:
+            async with await response.start_output() as output:
+                await output.send_audio(b"\x03\x04")
+        assert await receive_messages(client, 6) == [
+            linklab.ResponseStartedEvent(conversation_id, linklab.ResponseId(1), input_id, False),
+            linklab.StateEvent(conversation_id, 3, linklab.CoarseState.RESPONDING),
+            linklab.OutputStartedEvent(conversation_id, linklab.ResponseId(1), linklab.OutputId(1)),
+            linklab.OutputAudioEvent(
+                conversation_id,
+                linklab.ResponseId(1),
+                linklab.OutputId(1),
+                0,
+                b"\x03\x04",
+            ),
+            linklab.OutputEndedEvent(conversation_id, linklab.ResponseId(1), linklab.OutputId(1), 1),
+            linklab.ResponseEndedEvent(conversation_id, linklab.ResponseId(1)),
+        ]
+        await close_pair(server, client)
+
+    async def exceptional() -> None:
+        server, client, session, conversation_id, input_id = await open_ready_session()
+        response = await session.start_response(input_id)
+        with pytest.raises(LookupError, match="tts crashed"):
+            async with await response.start_output():
+                raise LookupError("tts crashed")
+        response_id = linklab.ResponseId(1)
+        assert await receive_messages(client, 6) == [
+            linklab.ResponseStartedEvent(conversation_id, response_id, input_id, False),
+            linklab.StateEvent(conversation_id, 3, linklab.CoarseState.RESPONDING),
+            linklab.OutputStartedEvent(conversation_id, response_id, linklab.OutputId(1)),
+            linklab.ErrorEvent(
+                linklab.ErrorScope.RESPONSE,
+                linklab.ErrorCode.TTS_FAILED,
+                True,
+                conversation_id,
+                response_id=response_id,
+            ),
+            linklab.ResponseCancelledEvent(conversation_id, response_id, linklab.ResponseCancelReason.TTS_FAILED),
+            linklab.StateEvent(conversation_id, 4, linklab.CoarseState.WAITING),
+        ]
+        with pytest.raises(linklab.WriterClosed):
+            await response.send_text_delta("late")
+        await close_pair(server, client)
+
+    run(normal())
+    run(exceptional())
+
+
+def test_output_writer_is_invalidated_by_manual_cancel_and_external_termination() -> None:
+    async def manual_cancel() -> None:
+        server, client, session, _, input_id = await open_ready_session()
+        response = await session.start_response(input_id)
+        output = await response.start_output()
+        await output.send_audio(b"\x00\x00")
+        await response.cancel(linklab.ResponseCancelReason.TTS_FAILED)
+        assert session._core.snapshots()[0].occupancy == 0
+        with pytest.raises(linklab.WriterClosed):
+            await output.send_audio(b"\x00\x00")
+        await receive_messages(client, 6)
+        await close_pair(server, client)
+
+    async def externally_ended() -> None:
+        server, client, session, _, input_id = await open_ready_session()
+        response = await session.start_response(input_id)
+        output = await response.start_output()
+        await session.end_conversation(linklab.ConversationEndReason.CANCELLED)
+        with pytest.raises(linklab.WriterClosed):
+            await output.finish()
+        await receive_messages(client, 5)
+        await close_pair(server, client)
+
+    run(manual_cancel())
     run(externally_ended())
