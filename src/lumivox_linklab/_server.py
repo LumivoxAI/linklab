@@ -19,6 +19,7 @@ from ._enums import (
     ProtocolObjectKind,
     ResponseCancelReason,
     ConversationEndReason,
+    PlaybackInterruptReason,
 )
 from ._config import ServerConfig
 from ._errors import WriterClosed, QueueOverflow, ProtocolViolation
@@ -132,12 +133,8 @@ class ResponseWriter:
         if response.output is not None:
             if response.output.terminal is None:
                 raise ProtocolViolation("response cannot finish before its output")
-        elif response.start.end_conversation:
-            messages.append(ConversationEndedEvent(conversation_id, ConversationEndReason.COMPLETED))
-        else:
-            state = self._session._next_state(CoarseState.WAITING)
-            if state is not None:
-                messages.append(state)
+        if response.output is None or isinstance(response.playback, PlaybackFinishedEvent):
+            messages.extend(self._session._completed_response_messages(response))
         self._session._enqueue_control(tuple(messages))
         self._session._response_terminated()
 
@@ -409,8 +406,14 @@ class ServerSession:
     def _accept_inbound(self, message: Message, transition: _TransitionResult) -> None:
         self._check_loop()
         if ProtocolObjectKind.RESPONSE in transition.cancellation_targets:
-            self._response_terminated()
-        if transition.dispatch and not self._events.put_nowait(message):
+            self._response_terminated(discard_output=True)
+        if isinstance(message, (PlaybackFinishedEvent, PlaybackInterruptedEvent)):
+            self._complete_playback_transition(message, transition)
+        dispatch = transition.dispatch or (
+            isinstance(message, (PlaybackFinishedEvent, PlaybackInterruptedEvent))
+            and ProtocolObjectKind.RESPONSE in transition.cancellation_targets
+        )
+        if dispatch and not self._events.put_nowait(message):
             self._record_handler_signal(_HandlerQueueFull(message))
         if isinstance(message, InputStartedEvent):
             self._enqueue_state(CoarseState.LISTENING)
@@ -489,7 +492,7 @@ class ServerSession:
         self._enqueue_control(tuple(messages))
         if closed_input_id is not None:
             self._server_closed_inputs.add(closed_input_id)
-        self._response_terminated()
+        self._response_terminated(discard_output=True)
 
     async def fail(self, scope: ErrorScope, code: ErrorCode, message: str | None = None) -> None:
         self._check_loop()
@@ -511,7 +514,7 @@ class ServerSession:
             self._enqueue_control((event,))
             if input_ is not None and input_.terminal is None:
                 self._server_closed_inputs.add(input_.start.input_id)
-            self._response_terminated()
+            self._response_terminated(discard_output=True)
             return
         if scope is ErrorScope.INPUT:
             input_ = self._require_recoverable_input()
@@ -532,11 +535,11 @@ class ServerSession:
         ):
             state = self._next_state(CoarseState.WAITING)
         self._enqueue_control((event,) if state is None else (event, state))
-        self._response_terminated()
+        self._response_terminated(discard_output=True)
 
     async def _close_dispatcher(self) -> None:
         self._check_loop()
-        self._response_terminated()
+        self._response_terminated(discard_output=True)
         self._events.close()
         task = self._dispatcher_task
         if task is not None and task is not asyncio.current_task() and not task.done():
@@ -666,17 +669,66 @@ class ServerSession:
             ),
         )
 
+    def _completed_response_messages(self, response: _Response) -> tuple[Message, ...]:
+        if response.start.end_conversation:
+            return (
+                ConversationEndedEvent(
+                    response.start.conversation_id,
+                    ConversationEndReason.COMPLETED,
+                ),
+            )
+        state = self._next_state(CoarseState.WAITING)
+        return () if state is None else (state,)
+
+    def _complete_playback_transition(
+        self,
+        message: PlaybackFinishedEvent | PlaybackInterruptedEvent,
+        transition: _TransitionResult,
+    ) -> None:
+        response = self._core.validator._find_response(self._core.validator._data, message.response_id)
+        assert response is not None
+        if isinstance(message, PlaybackFinishedEvent):
+            if response.end is not None and not isinstance(response.terminal, ResponseCancelledEvent):
+                self._enqueue_control(self._completed_response_messages(response))
+            return
+        if ProtocolObjectKind.RESPONSE not in transition.cancellation_targets:
+            return
+        if message.reason not in (
+            PlaybackInterruptReason.LOCAL_CANCEL,
+            PlaybackInterruptReason.SHUTDOWN,
+        ):
+            return
+        conversation = self._core.validator._data.conversation
+        if conversation is None:
+            return
+        if conversation.expected_end_reason is not None:
+            self._enqueue_control(
+                (
+                    ConversationEndedEvent(
+                        conversation.conversation_id,
+                        conversation.expected_end_reason,
+                    ),
+                )
+            )
+            return
+        state = self._next_state(CoarseState.WAITING)
+        if state is not None:
+            self._enqueue_control((state,))
+
     def _end_cancelled_conversation(self, message: ConversationCancelledEvent) -> None:
         messages = (
             *self._active_response_terminals(),
             ConversationEndedEvent(message.conversation_id, ConversationEndReason.CANCELLED),
         )
         self._enqueue_control(messages)
-        self._response_terminated()
+        self._response_terminated(discard_output=True)
 
-    def _response_terminated(self) -> None:
+    def _response_terminated(self, *, discard_output: bool = False) -> None:
         writer = self._response_writer
         if writer is not None:
+            output = writer._output_writer
+            if discard_output and output is not None:
+                output._discard_queued()
             writer._close()
             self._response_writer = None
 
