@@ -41,7 +41,7 @@ from ._messages import (
 )
 from ._protocol import _TransitionResult
 from ._handshake import _open_client_websocket
-from ._transport import _QueueLane, _OutboundBatch, _TransportCore
+from ._transport import _QueueLane, _OutboundBatch, _QueueSnapshot, _TransportCore
 from ._client_ingress import _IngressLane, _IngressBatch, _ClientAudioIngress
 
 _CONTROL_CAPACITY = 16
@@ -107,15 +107,23 @@ type _CallbackSignal = _CallbackQueueSaturated | _CallbackRaised
 
 
 class _CallbackQueue:
-    def __init__(self, event_capacity: int, output_capacity_frames: int, notify: Callable[[], None]) -> None:
+    def __init__(
+        self,
+        event_capacity: int,
+        output_capacity_frames: int,
+        notify: Callable[[], None],
+        clock: Callable[[], float],
+    ) -> None:
         self._event_capacity = event_capacity
         self._output_capacity_frames = output_capacity_frames
         self._notify = notify
+        self._clock = clock
         self._lock = Lock()
-        self._items: deque[tuple[_InboundEvent, _CallbackPath, int]] = deque()
+        self._items: deque[tuple[_InboundEvent, _CallbackPath, int, float]] = deque()
         self._event_occupancy = 0
         self._output_occupancy_frames = 0
         self._control_occupancy = 0
+        self._overflows = {path: 0 for path in _CallbackPath}
         self._closed = False
 
     def put_nowait(self, item: _InboundEvent, path: _CallbackPath, frames: int = 0) -> bool:
@@ -124,17 +132,20 @@ class _CallbackQueue:
                 return False
             if path is _CallbackPath.OUTPUT:
                 if self._output_occupancy_frames + frames > self._output_capacity_frames:
+                    self._overflows[path] += 1
                     return False
                 self._output_occupancy_frames += frames
             elif path is _CallbackPath.CONTROL:
                 if self._control_occupancy >= _CONTROL_CAPACITY:
+                    self._overflows[path] += 1
                     return False
                 self._control_occupancy += 1
             else:
                 if self._event_occupancy >= self._event_capacity:
+                    self._overflows[path] += 1
                     return False
                 self._event_occupancy += 1
-            self._items.append((item, path, frames))
+            self._items.append((item, path, frames, self._clock()))
         self._notify()
         return True
 
@@ -142,7 +153,7 @@ class _CallbackQueue:
         with self._lock:
             if not self._items:
                 return None
-            item, path, frames = self._items.popleft()
+            item, path, frames, _ = self._items.popleft()
             if path is _CallbackPath.OUTPUT:
                 self._output_occupancy_frames -= frames
             elif path is _CallbackPath.CONTROL:
@@ -153,9 +164,9 @@ class _CallbackQueue:
 
     def discard(self, predicate: Callable[[_InboundEvent], bool]) -> None:
         with self._lock:
-            retained: deque[tuple[_InboundEvent, _CallbackPath, int]] = deque()
+            retained: deque[tuple[_InboundEvent, _CallbackPath, int, float]] = deque()
             while self._items:
-                item, path, frames = self._items.popleft()
+                item, path, frames, enqueued_at = self._items.popleft()
                 if predicate(item):
                     if path is _CallbackPath.OUTPUT:
                         self._output_occupancy_frames -= frames
@@ -164,8 +175,35 @@ class _CallbackQueue:
                     else:
                         self._event_occupancy -= 1
                 else:
-                    retained.append((item, path, frames))
+                    retained.append((item, path, frames, enqueued_at))
             self._items = retained
+
+    def snapshots(self) -> tuple[_QueueSnapshot, _QueueSnapshot, _QueueSnapshot]:
+        with self._lock:
+            now = self._clock()
+
+            def snapshot(path: _CallbackPath, capacity: int, occupancy: int, unit: str) -> _QueueSnapshot:
+                oldest = next((item for item in self._items if item[1] is path), None)
+                residence = 0.0 if oldest is None else max(0.0, (now - oldest[3]) * 1_000)
+                return _QueueSnapshot(
+                    f"client_callbacks.{path.value}",
+                    capacity,
+                    occupancy,
+                    self._overflows[path],
+                    residence,
+                    unit,
+                )
+
+            return (
+                snapshot(_CallbackPath.EVENT, self._event_capacity, self._event_occupancy, "events"),
+                snapshot(
+                    _CallbackPath.OUTPUT,
+                    self._output_capacity_frames,
+                    self._output_occupancy_frames,
+                    "frames",
+                ),
+                snapshot(_CallbackPath.CONTROL, _CONTROL_CAPACITY, self._control_occupancy, "events"),
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -211,6 +249,7 @@ class VoiceClient:
             config.websocket_max_queue,
             playback_capacity,
             self._notify_callbacks,
+            self._loop.time,
         )
         self._callback_signals: asyncio.Queue[_CallbackSignal] = asyncio.Queue(maxsize=_CONTROL_CAPACITY)
         self._callback_signal_overflow = False
@@ -376,7 +415,10 @@ class VoiceClient:
                     weight = batch.audio_frames if batch.lane is _IngressLane.DATA else 1
                     try:
                         core.enqueue_batch(batch.messages, lane=lane, weight=weight, tag=batch)
-                    except QueueOverflow:
+                    except QueueOverflow as error:
+                        if lane is _QueueLane.CONTROL:
+                            core._request_close(1011, drain=False, loss=error)
+                            return
                         break
                     except ConnectionClosed:
                         return
@@ -466,11 +508,44 @@ class VoiceClient:
         frames = len(message.audio) // 2 if isinstance(message, OutputAudioEvent) else 0
         if not self._events.put_nowait(_InboundEvent(message, transition), path, frames):
             self._record_callback_signal(_CallbackQueueSaturated(path, message))
+            self._handle_callback_saturation(path, message)
 
     def _queue_connection_state(self, state: ConnectionState, reason: str | None = None) -> None:
         event = ConnectionStateEvent(state, reason)
         if not self._events.put_nowait(_InboundEvent(event), _CallbackPath.CONTROL):
             self._record_callback_signal(_CallbackQueueSaturated(_CallbackPath.CONTROL, event))
+            core = self._core
+            if core is not None:
+                core._request_close(1011, drain=False, loss=QueueOverflow("client callback control capacity exceeded"))
+
+    def _handle_callback_saturation(self, path: _CallbackPath, message: Message) -> None:
+        if path is _CallbackPath.OUTPUT:
+            if not isinstance(message, OutputAudioEvent):
+                self._request_overload_close("client output callback capacity exceeded")
+                return
+            self._events.discard(
+                lambda item: isinstance(item.message, (OutputStartedEvent, OutputAudioEvent, OutputEndedEvent))
+                and item.message.response_id == message.response_id
+            )
+            if not self._ingress.playback_interrupted(
+                message.output_id,
+                0,
+                PlaybackPosition.ESTIMATED,
+                PlaybackInterruptReason.OVERFLOW,
+            ):
+                self._request_overload_close("playback overflow accounting capacity exhausted")
+            return
+
+        if path is _CallbackPath.EVENT and self._ingress.state.conversation_id is not None:
+            if not self._ingress.cancel_conversation(ConversationCancelReason.CLIENT_FAILED):
+                self._request_overload_close("client callback cancellation capacity exhausted")
+            return
+        self._request_overload_close("client callback capacity exceeded")
+
+    def _request_overload_close(self, message: str) -> None:
+        core = self._core
+        if core is not None:
+            core._request_close(1011, drain=False, loss=QueueOverflow(message))
 
     def _record_callback_signal(self, signal: _CallbackSignal) -> None:
         try:
@@ -482,6 +557,8 @@ class VoiceClient:
     def _callback_path(message: Message) -> _CallbackPath:
         if isinstance(message, (OutputStartedEvent, OutputAudioEvent, OutputEndedEvent)):
             return _CallbackPath.OUTPUT
+        if isinstance(message, (ResponseCancelledEvent, ConversationEndedEvent, ErrorEvent)):
+            return _CallbackPath.CONTROL
         return _CallbackPath.EVENT
 
     async def _dispatch_callback(self, event: Message | ConnectionStateEvent) -> None:

@@ -51,7 +51,7 @@ from ._messages import (
 )
 from ._protocol import _Input, _Response, _TransitionResult
 from ._handshake import _serve_websocket, _perform_server_handshake
-from ._transport import _QueueLane, _TransportCore
+from ._transport import _QueueLane, _QueueSnapshot, _TransportCore
 
 _CONTROL_CAPACITY = 16
 
@@ -428,12 +428,15 @@ def _copy_output_pcm(audio: ReadableBuffer) -> bytes:
 
 
 class _HandlerQueue:
-    def __init__(self, audio_capacity_frames: int, event_capacity: int) -> None:
+    def __init__(self, audio_capacity_frames: int, event_capacity: int, clock: Callable[[], float]) -> None:
         self._audio_capacity_frames = audio_capacity_frames
         self._event_capacity = event_capacity
-        self._items: deque[tuple[Message, int]] = deque()
+        self._clock = clock
+        self._items: deque[tuple[Message, int, float]] = deque()
         self._audio_frames = 0
         self._events = 0
+        self._audio_overflows = 0
+        self._event_overflows = 0
         self._available = asyncio.Event()
         self._closed = False
 
@@ -443,13 +446,15 @@ class _HandlerQueue:
         frames = len(event.audio) // 2 if isinstance(event, InputAudioEvent) else 0
         if frames:
             if self._audio_frames + frames > self._audio_capacity_frames:
+                self._audio_overflows += 1
                 return False
             self._audio_frames += frames
         else:
             if self._events >= self._event_capacity:
+                self._event_overflows += 1
                 return False
             self._events += 1
-        self._items.append((event, frames))
+        self._items.append((event, frames, self._clock()))
         self._available.set()
         return True
 
@@ -459,7 +464,7 @@ class _HandlerQueue:
                 raise RuntimeError("handler queue is closed")
             self._available.clear()
             await self._available.wait()
-        event, frames = self._items.popleft()
+        event, frames, _ = self._items.popleft()
         if frames:
             self._audio_frames -= frames
         else:
@@ -467,6 +472,47 @@ class _HandlerQueue:
         if not self._items:
             self._available.clear()
         return event
+
+    def discard(self, predicate: Callable[[Message], bool]) -> None:
+        retained: deque[tuple[Message, int, float]] = deque()
+        while self._items:
+            event, frames, enqueued_at = self._items.popleft()
+            if predicate(event):
+                if frames:
+                    self._audio_frames -= frames
+                else:
+                    self._events -= 1
+            else:
+                retained.append((event, frames, enqueued_at))
+        self._items = retained
+        if not self._items:
+            self._available.clear()
+
+    def snapshots(self) -> tuple[_QueueSnapshot, _QueueSnapshot]:
+        now = self._clock()
+
+        def residence(audio: bool) -> float:
+            oldest = next((item for item in self._items if bool(item[1]) is audio), None)
+            return 0.0 if oldest is None else max(0.0, (now - oldest[2]) * 1_000)
+
+        return (
+            _QueueSnapshot(
+                "server_handler.audio",
+                self._audio_capacity_frames,
+                self._audio_frames,
+                self._audio_overflows,
+                residence(True),
+                "frames",
+            ),
+            _QueueSnapshot(
+                "server_handler.event",
+                self._event_capacity,
+                self._events,
+                self._event_overflows,
+                residence(False),
+                "events",
+            ),
+        )
 
     def close(self) -> None:
         self._closed = True
@@ -488,7 +534,7 @@ class ServerSession:
         self._loop = asyncio.get_running_loop()
         self._core = core
         self._handler: ServerHandler | None = None
-        self._events = _HandlerQueue(input_queue_frames, event_capacity)
+        self._events = _HandlerQueue(input_queue_frames, event_capacity, self._loop.time)
         self._handler_signals: asyncio.Queue[_HandlerSignal] = asyncio.Queue(maxsize=_CONTROL_CAPACITY)
         self._handler_signal_overflow = False
         self._dispatcher_task: asyncio.Task[None] | None = None
@@ -515,6 +561,7 @@ class ServerSession:
         )
         if dispatch and not self._events.put_nowait(message):
             self._record_handler_signal(_HandlerQueueFull(message))
+            self._handle_handler_saturation(message)
         if isinstance(message, InputStartedEvent):
             self._enqueue_state(CoarseState.LISTENING)
         elif isinstance(message, InputAbortedEvent):
@@ -708,8 +755,33 @@ class ServerSession:
         except asyncio.QueueFull:
             self._handler_signal_overflow = True
 
+    def _handle_handler_saturation(self, message: Message) -> None:
+        if not isinstance(message, InputAudioEvent):
+            self._core._request_close(1011, drain=False, loss=QueueOverflow("server handler event capacity exceeded"))
+            return
+
+        input_ = self._core.validator._find_input(self._core.validator._data, message.input_id)
+        if input_ is None or input_.terminal is not None or input_.failure is not None:
+            return
+        conversation_id = self._require_conversation_id()
+        error = ErrorEvent(
+            ErrorScope.INPUT,
+            ErrorCode.INPUT_OVERFLOW,
+            True,
+            conversation_id,
+            message.input_id,
+        )
+        state = self._next_state(CoarseState.WAITING)
+        self._enqueue_control((error,) if state is None else (error, state))
+        self._server_closed_inputs.add(message.input_id)
+        self._events.discard(lambda event: isinstance(event, InputAudioEvent) and event.input_id == message.input_id)
+
     def _enqueue_control(self, messages: tuple[Message, ...]) -> None:
-        self._core.enqueue_batch(messages, lane=_QueueLane.CONTROL)
+        try:
+            self._core.enqueue_batch(messages, lane=_QueueLane.CONTROL)
+        except QueueOverflow as error:
+            self._core._request_close(1011, drain=False, loss=error)
+            raise
         self._timeouts.sync()
 
     def _enqueue_state(self, state: CoarseState) -> None:
