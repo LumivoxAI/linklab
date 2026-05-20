@@ -15,6 +15,7 @@ from ._enums import (
     ErrorScope,
     CoarseState,
     EndpointRole,
+    ConnectionState,
     InputCloseReason,
     ProtocolObjectKind,
     ResponseCancelReason,
@@ -86,6 +87,97 @@ class _HandlerRaised:
 
 
 type _HandlerSignal = _HandlerQueueFull | _HandlerRaised
+
+
+class _LifecycleTimeouts:
+    def __init__(self, session: ServerSession, config: ServerConfig) -> None:
+        self._session = session
+        self._loop = session._loop
+        self._waiting_s = config.waiting_timeout_s
+        self._input_s = config.input_timeout_s
+        self._processing_s = config.processing_timeout_s
+        self._idle_s = session._core._limits.idle_timeout_ms / 1_000
+        self._key: tuple[str, int | None] | None = None
+        self._object_deadline: float | None = None
+        self._idle_deadline: float | None = None
+        self._handle: asyncio.TimerHandle | None = None
+        self._generation = 0
+
+    @property
+    def deadlines(self) -> tuple[float | None, float | None]:
+        return self._object_deadline, self._idle_deadline
+
+    def sync(self) -> None:
+        key = self._session._timeout_phase()
+        if key == self._key:
+            return
+        self._generation += 1
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        self._key = key
+        self._object_deadline = None
+        self._idle_deadline = None
+        if key is None:
+            return
+
+        phase, _ = key
+        now = self._loop.time()
+        if phase == "input":
+            self._object_deadline = now + self._input_s
+        elif phase == "processing":
+            self._object_deadline = now + self._processing_s
+            self._idle_deadline = now + self._idle_s
+        elif phase == "waiting":
+            self._object_deadline = now + self._waiting_s
+            self._idle_deadline = now + self._idle_s
+        elif phase == "idle":
+            self._idle_deadline = now + self._idle_s
+        self._schedule()
+
+    def close(self) -> None:
+        self._generation += 1
+        self._key = None
+        self._object_deadline = None
+        self._idle_deadline = None
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+
+    def run_due(self, now: float | None = None) -> None:
+        generation = self._generation
+        if self._handle is not None:
+            self._handle.cancel()
+        self._handle = None
+        current = self._loop.time() if now is None else now
+        key = self._key
+        if key is None or key != self._session._timeout_phase():
+            self.sync()
+            return
+
+        phase, _ = key
+        if self._object_deadline is not None and current >= self._object_deadline:
+            self._session._on_object_timeout(phase)
+        elif self._idle_deadline is not None and current >= self._idle_deadline:
+            self._session._on_idle_timeout()
+
+        if generation == self._generation:
+            self._schedule()
+
+    def _schedule(self) -> None:
+        deadlines = tuple(deadline for deadline in (self._object_deadline, self._idle_deadline) if deadline is not None)
+        if not deadlines:
+            return
+        generation = self._generation
+
+        def wake() -> None:
+            if generation == self._generation:
+                try:
+                    self.run_due()
+                except Exception as error:
+                    self._session._core._request_close(1011, drain=False, loss=error)
+
+        self._handle = self._loop.call_at(min(deadlines), wake)
 
 
 class ResponseWriter:
@@ -385,7 +477,14 @@ class _HandlerQueue:
 
 
 class ServerSession:
-    def __init__(self, core: _TransportCore, *, input_queue_frames: int, event_capacity: int) -> None:
+    def __init__(
+        self,
+        core: _TransportCore,
+        *,
+        config: ServerConfig,
+        input_queue_frames: int,
+        event_capacity: int,
+    ) -> None:
         self._loop = asyncio.get_running_loop()
         self._core = core
         self._handler: ServerHandler | None = None
@@ -395,6 +494,7 @@ class ServerSession:
         self._dispatcher_task: asyncio.Task[None] | None = None
         self._server_closed_inputs: set[InputId] = set()
         self._response_writer: ResponseWriter | None = None
+        self._timeouts = _LifecycleTimeouts(self, config)
 
     def _set_handler(self, handler: ServerHandler) -> None:
         self._check_loop()
@@ -419,8 +519,13 @@ class ServerSession:
             self._enqueue_state(CoarseState.LISTENING)
         elif isinstance(message, InputAbortedEvent):
             self._enqueue_state(CoarseState.PROCESSING)
+        elif any(isinstance(item, ErrorEvent) and item.scope is ErrorScope.INPUT for item in transition.outbound):
+            if isinstance(message, InputAudioEvent):
+                self._server_closed_inputs.add(message.input_id)
+            self._enqueue_state(CoarseState.WAITING)
         elif isinstance(message, ConversationCancelledEvent) and transition.dispatch:
             self._end_cancelled_conversation(message)
+        self._timeouts.sync()
 
     async def close_input(self, input_id: InputId, reason: InputCloseReason) -> None:
         self._check_loop()
@@ -539,6 +644,7 @@ class ServerSession:
 
     async def _close_dispatcher(self) -> None:
         self._check_loop()
+        self._timeouts.close()
         self._response_terminated(discard_output=True)
         self._events.close()
         task = self._dispatcher_task
@@ -559,7 +665,21 @@ class ServerSession:
                     if event.input_id in self._server_closed_inputs:
                         continue
                     end_frame = event.start_frame + len(event.audio) // 2
-                    self._core.commit_input_audio(event.input_id, end_frame)
+                    limits = self._core.validator._data.server_hello
+                    assert limits is not None
+                    input_ = self._core.validator._find_input(self._core.validator._data, event.input_id)
+                    reaches_limit = (
+                        end_frame == limits.limits.max_input_frames and input_ is not None and input_.terminal is None
+                    )
+                    state = self._next_state(CoarseState.PROCESSING) if reaches_limit else None
+                    terminals = self._core.commit_input_audio(
+                        event.input_id,
+                        end_frame,
+                        following=() if state is None else (state,),
+                    )
+                    if terminals:
+                        self._server_closed_inputs.add(event.input_id)
+                        self._timeouts.sync()
                 await self._dispatch(event)
             except asyncio.CancelledError:
                 raise
@@ -590,6 +710,7 @@ class ServerSession:
 
     def _enqueue_control(self, messages: tuple[Message, ...]) -> None:
         self._core.enqueue_batch(messages, lane=_QueueLane.CONTROL)
+        self._timeouts.sync()
 
     def _enqueue_state(self, state: CoarseState) -> None:
         event = self._next_state(state)
@@ -732,6 +853,84 @@ class ServerSession:
             writer._close()
             self._response_writer = None
 
+    def _timeout_phase(self) -> tuple[str, int | None] | None:
+        validator = self._core.validator
+        if validator.state.connection_state is not ConnectionState.READY:
+            return None
+        conversation = validator._data.conversation
+        if conversation is None or conversation.cancel is not None or conversation.failure is not None:
+            return None
+        response = validator._current_response(validator._data, conversation)
+        if response is not None:
+            return ("response", int(response.start.response_id))
+        input_ = validator._current_input(validator._data, conversation)
+        if input_ is not None:
+            if input_.terminal is None and input_.failure is None:
+                return ("input", int(input_.start.input_id))
+            if input_.failure is None and input_.response_id is None:
+                return ("processing", int(input_.start.input_id))
+        state = conversation.state
+        if state is not None and state.state is CoarseState.WAITING:
+            return ("waiting", int(conversation.conversation_id))
+        return ("idle", int(conversation.conversation_id))
+
+    def _on_object_timeout(self, phase: str) -> None:
+        key = self._timeout_phase()
+        if key is None or key[0] != phase:
+            self._timeouts.sync()
+            return
+        conversation_id = self._require_conversation_id()
+        conversation = self._core.validator._data.conversation
+        assert conversation is not None
+        input_ = self._core.validator._current_input(self._core.validator._data, conversation)
+        if phase == "input":
+            assert input_ is not None
+            close = InputClosedEvent(
+                conversation_id,
+                input_.start.input_id,
+                input_.committed_end_frame,
+                InputCloseReason.MAX_DURATION,
+            )
+            state = self._next_state(CoarseState.PROCESSING)
+            self._enqueue_control((close,) if state is None else (close, state))
+            self._server_closed_inputs.add(input_.start.input_id)
+            return
+        if phase == "processing":
+            assert input_ is not None
+            error = ErrorEvent(
+                ErrorScope.INPUT,
+                ErrorCode.PROCESSING_TIMEOUT,
+                True,
+                conversation_id,
+                input_.start.input_id,
+            )
+            state = self._next_state(CoarseState.WAITING)
+            self._enqueue_control((error,) if state is None else (error, state))
+            self._server_closed_inputs.add(input_.start.input_id)
+            return
+        if phase == "waiting":
+            self._expire_conversation(conversation_id)
+
+    def _on_idle_timeout(self) -> None:
+        key = self._timeout_phase()
+        if key is None or key[0] in ("input", "response"):
+            self._timeouts.sync()
+            return
+        self._expire_conversation(self._require_conversation_id())
+
+    def _expire_conversation(self, conversation_id: ConversationId) -> None:
+        self._enqueue_control(
+            (
+                ErrorEvent(
+                    ErrorScope.CONVERSATION,
+                    ErrorCode.IDLE_TIMEOUT,
+                    True,
+                    conversation_id,
+                ),
+            )
+        )
+        self._response_terminated(discard_output=True)
+
     def _check_loop(self) -> None:
         try:
             loop = asyncio.get_running_loop()
@@ -842,6 +1041,7 @@ class VoiceServer:
             )
             session = ServerSession(
                 core,
+                config=self._config,
                 input_queue_frames=self._config.input_queue_frames,
                 event_capacity=self._config.websocket_max_queue,
             )

@@ -320,7 +320,13 @@ class _TransportCore:
         self._check_loop()
         return self._queue.discard(predicate)
 
-    def commit_input_audio(self, input_id: InputId, end_frame: int) -> None:
+    def commit_input_audio(
+        self,
+        input_id: InputId,
+        end_frame: int,
+        *,
+        following: tuple[Message, ...] = (),
+    ) -> tuple[Message, ...]:
         """Commit callback delivery and atomically queue any resulting close."""
         self._check_loop()
         if self._reader_task is None:
@@ -331,8 +337,18 @@ class _TransportCore:
         try:
             messages = self._validator._commit_input_audio(input_id, end_frame)
             if messages:
-                frames = tuple(_encode_message_with_limits(message, self._limits) for message in messages)
+                data = self._validator._data
+                wire_messages = list(messages)
+                for message in following:
+                    data, result = self._validator._transition(data, message)
+                    wire_messages.append(message)
+                    wire_messages.extend(result.outbound)
+                frames = tuple(_encode_message_with_limits(message, self._limits) for message in wire_messages)
                 self._queue.put_nowait(frames, lane=_QueueLane.CONTROL, weight=len(frames))
+                self._validator._data = data
+            elif following:
+                raise ValueError("following messages require an input terminal")
+            return messages
         except BaseException:
             self._validator._data = previous
             raise
