@@ -407,9 +407,100 @@ def test_handler_queue_full_and_callback_failure_are_explicit_signals() -> None:
         assert isinstance(first.error, LookupError)
         assert isinstance(second, _HandlerQueueFull)
         assert cast(linklab.InputAudioEvent, second.event).start_frame == 4
+        audio_snapshot, event_snapshot = session._events.snapshots()
+        assert (audio_snapshot.capacity, audio_snapshot.occupancy, audio_snapshot.overflow_count) == (2, 0, 1)
+        assert event_snapshot.overflow_count == 0
+
+        assert await receive_messages(client, 5) == [
+            linklab.StateEvent(conversation_id, 1, linklab.CoarseState.LISTENING),
+            linklab.ErrorEvent(
+                linklab.ErrorScope.INPUT,
+                linklab.ErrorCode.INPUT_OVERFLOW,
+                True,
+                conversation_id,
+                input_id,
+            ),
+            linklab.InputClosedEvent(conversation_id, input_id, 2, linklab.InputCloseReason.FAILED),
+            linklab.TranscriptFinalEvent(conversation_id, input_id, ""),
+            linklab.StateEvent(conversation_id, 2, linklab.CoarseState.WAITING),
+        ]
 
         handler.release.set()
+        await asyncio.sleep(0)
+        audio_events = [event for event in handler.events if isinstance(event, linklab.InputAudioEvent)]
+        assert [event.start_frame for event in audio_events] == [0]
+        next_input_id = linklab.InputId(2)
+        await send_message(
+            client.connection,
+            linklab.InputStartedEvent(conversation_id, next_input_id, linklab.InputStartReason.SPEECH, 0),
+        )
+        await wait_for_count(handler.events, 4)
+        assert handler.events[-1] == linklab.InputStartedEvent(
+            conversation_id,
+            next_input_id,
+            linklab.InputStartReason.SPEECH,
+            0,
+        )
         await client.connection.close()
+        await server.close()
+
+    run(scenario())
+
+
+def test_non_audio_handler_overflow_closes_only_affected_session() -> None:
+    class BlockingHandler(RecordingHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def on_conversation_started(
+            self,
+            _session: linklab.ServerSession,
+            event: linklab.ConversationStartedEvent,
+        ) -> None:
+            self.events.append(event)
+            self.entered.set()
+            await self.release.wait()
+
+    async def scenario() -> None:
+        config = server_config(max_connections=2, websocket_max_queue=1)
+        handlers: list[RecordingHandler] = []
+
+        def factory(_session: linklab.ServerSession) -> RecordingHandler:
+            handler: RecordingHandler = BlockingHandler() if not handlers else RecordingHandler()
+            handlers.append(handler)
+            return handler
+
+        server = linklab.VoiceServer(config, factory, object())
+        await server.serve()
+        overloaded = await _open_client_websocket(client_config(config.port))
+        healthy = await _open_client_websocket(client_config(config.port))
+        await wait_for_count(cast(list[object], handlers), 2)
+        blocking = cast(BlockingHandler, handlers[0])
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+
+        await send_message(overloaded.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await blocking.entered.wait()
+        await send_message(
+            overloaded.connection,
+            linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0),
+        )
+        await send_message(
+            overloaded.connection,
+            linklab.InputAbortedEvent(conversation_id, input_id, linklab.InputAbortReason.CAPTURE_FAILED),
+        )
+        await overloaded.connection.wait_closed()
+        assert overloaded.connection.close_code == 1011
+
+        await send_message(healthy.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await wait_for_count(handlers[1].events, 1)
+        assert isinstance(handlers[1].events[0], linklab.ConversationStartedEvent)
+        assert healthy.connection.close_code is None
+
+        blocking.release.set()
+        await healthy.connection.close()
         await server.close()
 
     run(scenario())

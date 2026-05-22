@@ -9,6 +9,7 @@ import pytest
 import lumivox_linklab as linklab
 from lumivox_linklab._protocol import _IdAllocator
 from lumivox_linklab._handshake import _open_client_websocket
+from lumivox_linklab._transport import _QueueLane
 
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
 
@@ -381,6 +382,25 @@ def test_output_backpressure_rejects_whole_chunk_and_commits_terminal_batch() ->
             linklab.StateEvent(conversation_id, 4, linklab.CoarseState.WAITING),
         ]
         await close_pair(server, client)
+
+    run(scenario())
+
+
+def test_server_reserved_control_exhaustion_closes_1011_without_partial_transition() -> None:
+    async def scenario() -> None:
+        server, client, session, _, input_id = await open_ready_session()
+        core = session._core
+        before = core.validator._data
+        core._queue._occupancy[_QueueLane.CONTROL] = core._queue._capacities[_QueueLane.CONTROL]
+
+        with pytest.raises(linklab.QueueOverflow):
+            await session.start_response(input_id)
+        await client.connection.wait_closed()
+
+        assert client.connection.close_code == 1011
+        assert core.validator._data.conversation == before.conversation
+        assert core.snapshots()[1].overflow_count == 1
+        await server.close()
 
     run(scenario())
 

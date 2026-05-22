@@ -9,6 +9,7 @@ from websockets.asyncio.server import Server, ServerConnection
 import lumivox_linklab as linklab
 from lumivox_linklab._client import _CallbackPath, _CallbackRaised, _CallbackQueueSaturated
 from lumivox_linklab._handshake import _ClientHandshake, _serve_websocket, _perform_server_handshake
+from lumivox_linklab._transport import _QueueLane
 
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
 CAPABILITIES = ("barge_in", "playback_accounting", "speech_spans")
@@ -499,6 +500,15 @@ def test_slow_non_output_callback_is_bounded_and_does_not_block_reader(monkeypat
         assert client._events.qsize() == 1
         assert client.connection_state is linklab.ConnectionState.READY
         assert connection.close_codes == []
+        await wait_for_sent(connection, 4)
+        assert linklab.decode_message(
+            connection.sent[-1],
+            direction=linklab.MessageDirection.CLIENT_TO_SERVER,
+            limits=linklab.ConnectionLimits(max_output_audio_frames=1_600),
+        ) == linklab.ConversationCancelledEvent(
+            linklab.ConversationId(1),
+            linklab.ConversationCancelReason.CLIENT_FAILED,
+        )
         callbacks.release.set()
         await client.close()
 
@@ -619,13 +629,54 @@ def test_slow_output_callback_uses_frame_capacity_and_reports_output_saturation(
         assert isinstance(signal.event, linklab.OutputAudioEvent)
         assert signal.event.start_frame == 11
         assert client.connection_state is linklab.ConnectionState.READY
+        event_snapshot, output_snapshot, control_snapshot = client._events.snapshots()
+        assert event_snapshot.overflow_count == 0
+        assert (output_snapshot.capacity, output_snapshot.occupancy, output_snapshot.overflow_count) == (16, 0, 1)
+        assert control_snapshot.overflow_count == 0
+
+        await wait_for_sent(connection, 4)
+        assert linklab.decode_message(
+            connection.sent[-1],
+            direction=linklab.MessageDirection.CLIENT_TO_SERVER,
+            limits=linklab.ConnectionLimits(max_output_audio_frames=1_600),
+        ) == linklab.PlaybackInterruptedEvent(
+            linklab.ConversationId(1),
+            linklab.ResponseId(1),
+            linklab.OutputId(1),
+            0,
+            linklab.PlaybackPosition.ESTIMATED,
+            linklab.PlaybackInterruptReason.OVERFLOW,
+        )
 
         callbacks.release.set()
-        async with asyncio.timeout(1):
-            while not any(isinstance(event, linklab.OutputEndedEvent) for event in callbacks.events):
-                await asyncio.sleep(0)
+        await asyncio.sleep(0)
         output_audio = [event for event in callbacks.events if isinstance(event, linklab.OutputAudioEvent)]
-        assert [event.start_frame for event in output_audio] == [0, 1]
+        assert [event.start_frame for event in output_audio] == [0]
+        assert not any(isinstance(event, linklab.OutputEndedEvent) for event in callbacks.events)
         await client.close()
+
+    run(scenario())
+
+
+def test_client_transport_control_exhaustion_closes_1011(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        connection = FakeConnection()
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            return fake_handshake(connection)
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), NullCallbacks(), object())
+        await client.connect()
+        await open_input(client, connection)
+        core = client._core
+        assert core is not None
+        core._queue._occupancy[_QueueLane.CONTROL] = core._queue._capacities[_QueueLane.CONTROL]
+
+        assert client.cancel_conversation(linklab.ConversationCancelReason.CLIENT_FAILED)
+        await client.wait_closed()
+
+        assert connection.close_codes == [1011]
+        assert core.snapshots()[1].overflow_count == 1
 
     run(scenario())
