@@ -267,6 +267,7 @@ class VoiceClient:
         self._connect_started = False
         self._output_format: AudioFormat | None = None
         self._transport_loss: BaseException | None = None
+        self._local_failure: BaseException | None = None
 
     @property
     def connection_state(self) -> ConnectionState:
@@ -319,6 +320,8 @@ class VoiceClient:
             self._monitor_task = self._loop.create_task(self._monitor_transport(), name="linklab-client-monitor")
             self._wake.set()
             self._queue_connection_state(ConnectionState.READY)
+            if self._local_failure is not None:
+                core._request_close(1011, drain=False, loss=self._local_failure)
         except BaseException:
             if core is not None:
                 with suppress(Exception):
@@ -502,6 +505,7 @@ class VoiceClient:
                 raise
             except Exception as error:
                 self._record_callback_signal(_CallbackRaised(path, message, error))
+                self._handle_callback_failure(path, message, error)
 
     def _queue_callback(self, message: Message, transition: _TransitionResult) -> None:
         path = self._callback_path(message)
@@ -542,10 +546,43 @@ class VoiceClient:
             return
         self._request_overload_close("client callback capacity exceeded")
 
+    def _handle_callback_failure(
+        self,
+        path: _CallbackPath,
+        message: Message | ConnectionStateEvent,
+        error: Exception,
+    ) -> None:
+        if not isinstance(message, ConnectionStateEvent) and not self._ingress.is_current(message):
+            return
+        if path is _CallbackPath.OUTPUT:
+            assert isinstance(message, (OutputStartedEvent, OutputAudioEvent, OutputEndedEvent))
+            self._events.discard(
+                lambda item: isinstance(item.message, (OutputStartedEvent, OutputAudioEvent, OutputEndedEvent))
+                and item.message.response_id == message.response_id
+            )
+            if self._ingress.playback_interrupted(
+                message.output_id,
+                0,
+                PlaybackPosition.ESTIMATED,
+                PlaybackInterruptReason.PLAYBACK_FAILED,
+            ):
+                return
+        elif self._ingress.state.conversation_id is not None:
+            if self._ingress.cancel_conversation(ConversationCancelReason.CLIENT_FAILED):
+                return
+        self._request_implementation_close(error)
+
     def _request_overload_close(self, message: str) -> None:
         core = self._core
         if core is not None:
             core._request_close(1011, drain=False, loss=QueueOverflow(message))
+
+    def _request_implementation_close(self, error: BaseException) -> None:
+        if self._local_failure is None:
+            self._local_failure = error
+        core = self._core
+        if core is not None:
+            core._request_close(1011, drain=False, loss=self._local_failure)
 
     def _record_callback_signal(self, signal: _CallbackSignal) -> None:
         try:

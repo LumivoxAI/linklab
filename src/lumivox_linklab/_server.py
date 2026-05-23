@@ -708,30 +708,95 @@ class ServerSession:
             except RuntimeError:
                 return
             try:
-                if isinstance(event, InputAudioEvent):
-                    if event.input_id in self._server_closed_inputs:
-                        continue
-                    end_frame = event.start_frame + len(event.audio) // 2
-                    limits = self._core.validator._data.server_hello
-                    assert limits is not None
-                    input_ = self._core.validator._find_input(self._core.validator._data, event.input_id)
-                    reaches_limit = (
-                        end_frame == limits.limits.max_input_frames and input_ is not None and input_.terminal is None
-                    )
-                    state = self._next_state(CoarseState.PROCESSING) if reaches_limit else None
-                    terminals = self._core.commit_input_audio(
-                        event.input_id,
-                        end_frame,
-                        following=() if state is None else (state,),
-                    )
-                    if terminals:
-                        self._server_closed_inputs.add(event.input_id)
-                        self._timeouts.sync()
+                if not self._prepare_handler_event(event):
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._core._request_close(1011, drain=False, loss=error)
+                return
+            try:
                 await self._dispatch(event)
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 self._record_handler_signal(_HandlerRaised(event, error))
+                try:
+                    self._handle_handler_failure(event)
+                except Exception as mapping_error:
+                    self._core._request_close(1011, drain=False, loss=mapping_error)
+                    return
+
+    def _prepare_handler_event(self, event: Message) -> bool:
+        if not isinstance(event, InputAudioEvent):
+            return True
+        if event.input_id in self._server_closed_inputs:
+            return False
+        end_frame = event.start_frame + len(event.audio) // 2
+        limits = self._core.validator._data.server_hello
+        assert limits is not None
+        input_ = self._core.validator._find_input(self._core.validator._data, event.input_id)
+        reaches_limit = end_frame == limits.limits.max_input_frames and input_ is not None and input_.terminal is None
+        state = self._next_state(CoarseState.PROCESSING) if reaches_limit else None
+        terminals = self._core.commit_input_audio(
+            event.input_id,
+            end_frame,
+            following=() if state is None else (state,),
+        )
+        if terminals:
+            self._server_closed_inputs.add(event.input_id)
+            self._timeouts.sync()
+        return True
+
+    def _handle_handler_failure(self, event: Message) -> None:
+        conversation = self._core.validator._data.conversation
+        if conversation is None or conversation.cancel is not None or conversation.failure is not None:
+            return
+        if isinstance(event, (InputStartedEvent, InputAudioEvent, InputAbortedEvent)):
+            input_ = self._core.validator._current_input(self._core.validator._data, conversation)
+            if (
+                input_ is None
+                or input_.start.input_id != event.input_id
+                or input_.response_id is not None
+                or input_.failure is not None
+            ):
+                return
+            error = ErrorEvent(
+                ErrorScope.INPUT,
+                ErrorCode.STT_FAILED,
+                True,
+                conversation.conversation_id,
+                event.input_id,
+            )
+            state = self._next_state(CoarseState.WAITING)
+            self._enqueue_control((error,) if state is None else (error, state))
+            self._server_closed_inputs.add(event.input_id)
+            self._events.discard(
+                lambda queued: isinstance(queued, InputAudioEvent) and queued.input_id == event.input_id
+            )
+            return
+        if isinstance(event, (PlaybackFinishedEvent, PlaybackInterruptedEvent)):
+            response = self._core.validator._current_response(self._core.validator._data, conversation)
+            if response is None or response.start.response_id != event.response_id or response.terminal is not None:
+                return
+            error = ErrorEvent(
+                ErrorScope.RESPONSE,
+                ErrorCode.PLAYBACK_FAILED,
+                True,
+                conversation.conversation_id,
+                response_id=event.response_id,
+            )
+            self._enqueue_control((error,))
+            self._response_terminated(discard_output=True)
+            return
+        error = ErrorEvent(
+            ErrorScope.CONVERSATION,
+            ErrorCode.CONVERSATION_FAILED,
+            True,
+            conversation.conversation_id,
+        )
+        self._enqueue_control((error,))
+        self._response_terminated(discard_output=True)
 
     async def _dispatch(self, event: Message) -> None:
         handler = self._handler
