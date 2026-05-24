@@ -77,6 +77,7 @@ class RecordingCallbacks(NullCallbacks):
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.fail_state = False
+        self.fail_output = False
 
     async def _record(self, event: object) -> None:
         self.events.append(event)
@@ -119,6 +120,9 @@ class RecordingCallbacks(NullCallbacks):
 
     async def on_output_audio(self, event: linklab.OutputAudioEvent) -> None:
         await self._record(event)
+        if self.fail_output:
+            self.fail_output = False
+            raise RuntimeError("output callback failed")
         if self.block_output:
             self.entered.set()
             await self.release.wait()
@@ -431,7 +435,9 @@ def test_callbacks_are_ordered_include_terminal_rearm_and_stop_before_close_retu
     run(scenario())
 
 
-def test_callback_failures_are_typed_and_dispatch_continues(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_non_output_callback_failure_cancels_conversation_and_dispatch_continues(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     async def scenario() -> None:
         connection = FakeConnection()
         callbacks = RecordingCallbacks()
@@ -457,7 +463,101 @@ def test_callback_failures_are_typed_and_dispatch_continues(monkeypatch: pytest.
         assert signal.path is _CallbackPath.EVENT
         assert isinstance(signal.error, RuntimeError)
         assert client.connection_state is linklab.ConnectionState.READY
+        await wait_for_sent(connection, 4)
+        assert linklab.decode_message(
+            connection.sent[-1],
+            direction=linklab.MessageDirection.CLIENT_TO_SERVER,
+            limits=linklab.ConnectionLimits(max_output_audio_frames=1_600),
+        ) == linklab.ConversationCancelledEvent(
+            linklab.ConversationId(1),
+            linklab.ConversationCancelReason.CLIENT_FAILED,
+        )
         await client.close()
+
+    run(scenario())
+
+
+def test_output_callback_failure_flushes_output_and_reports_playback_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        connection = FakeConnection()
+        callbacks = RecordingCallbacks()
+        callbacks.fail_output = True
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            return fake_handshake(connection)
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        await client.connect()
+        await open_input(client, connection)
+        await start_response(connection)
+        await send_server(
+            connection,
+            linklab.OutputStartedEvent(linklab.ConversationId(1), linklab.ResponseId(1), linklab.OutputId(1)),
+            linklab.OutputAudioEvent(
+                linklab.ConversationId(1),
+                linklab.ResponseId(1),
+                linklab.OutputId(1),
+                0,
+                b"\x01\x02",
+            ),
+            linklab.OutputAudioEvent(
+                linklab.ConversationId(1),
+                linklab.ResponseId(1),
+                linklab.OutputId(1),
+                1,
+                b"\x03\x04",
+            ),
+        )
+        async with asyncio.timeout(1):
+            while client._callback_signals.empty():
+                await asyncio.sleep(0)
+
+        signal = client._callback_signals.get_nowait()
+        assert isinstance(signal, _CallbackRaised)
+        assert signal.path is _CallbackPath.OUTPUT
+        await wait_for_sent(connection, 4)
+        assert linklab.decode_message(
+            connection.sent[-1],
+            direction=linklab.MessageDirection.CLIENT_TO_SERVER,
+            limits=linklab.ConnectionLimits(max_output_audio_frames=1_600),
+        ) == linklab.PlaybackInterruptedEvent(
+            linklab.ConversationId(1),
+            linklab.ResponseId(1),
+            linklab.OutputId(1),
+            0,
+            linklab.PlaybackPosition.ESTIMATED,
+            linklab.PlaybackInterruptReason.PLAYBACK_FAILED,
+        )
+        assert [event.start_frame for event in callbacks.events if isinstance(event, linklab.OutputAudioEvent)] == [0]
+        await client.close()
+
+    run(scenario())
+
+
+def test_callback_failure_without_conversation_closes_1011(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FailingCallbacks(NullCallbacks):
+        async def on_connection_state(self, event: linklab.ConnectionStateEvent) -> None:
+            if event.state is linklab.ConnectionState.READY:
+                raise RuntimeError("connection callback failed")
+
+    async def scenario() -> None:
+        connection = FakeConnection()
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            return fake_handshake(connection)
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), FailingCallbacks(), object())
+        await client.connect()
+        await client.wait_closed()
+
+        signal = client._callback_signals.get_nowait()
+        assert isinstance(signal, _CallbackRaised)
+        assert connection.close_codes == [1011]
+        assert_disconnected(client)
 
     run(scenario())
 
