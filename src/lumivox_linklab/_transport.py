@@ -246,6 +246,7 @@ class _TransportCore:
         self._fatal = False
         self._closed = asyncio.Event()
         self._loss: BaseException | None = None
+        self._transport_lost = False
         self._outcome: _TransportOutcome | None = None
 
     @property
@@ -319,6 +320,26 @@ class _TransportCore:
     def discard_queued(self, predicate: Callable[[_OutboundBatch], bool]) -> tuple[_OutboundBatch, ...]:
         self._check_loop()
         return self._queue.discard(predicate)
+
+    def seal_orderly(self, messages: tuple[Message, ...]) -> None:
+        """Discard ordinary backlog and retain one validated terminal batch."""
+        self._check_loop()
+        if self._reader_task is None:
+            raise RuntimeError("transport core is not started")
+        if self._closing:
+            raise ConnectionClosed("transport core is closing")
+        if not messages:
+            raise ValueError("messages must not be empty")
+
+        data = self._validator._data
+        wire_messages: list[Message] = []
+        for message in messages:
+            data, result = self._validator._transition(data, message)
+            wire_messages.append(message)
+            wire_messages.extend(result.outbound)
+        frames = tuple(_encode_message_with_limits(message, self._limits) for message in wire_messages)
+        self._queue.seal(frames)
+        self._validator._data = data
 
     def commit_input_audio(
         self,
@@ -494,9 +515,7 @@ class _TransportCore:
         return self._request_close(1002, drain=True, loss=cause)
 
     def _request_transport_loss(self, error: BaseException, close_code: int | None) -> asyncio.Task[None]:
-        if self._close_task is not None:
-            return self._close_task
-        self._closing = True
+        self._transport_lost = True
         self._loss = error
         self._outcome = _TransportOutcome(
             close_code,
@@ -505,6 +524,9 @@ class _TransportCore:
             error=error,
         )
         self._queue.close(discard=True)
+        if self._close_task is not None:
+            return self._close_task
+        self._closing = True
         self._close_task = self._loop.create_task(
             self._shutdown(close_code, drain=False, transport_lost=True),
             name="linklab-transport-close",
@@ -556,7 +578,7 @@ class _TransportCore:
             await self._join_task(reader, current, deadline)
             await self._join_task(writer, current, deadline)
             await self._join_task(keepalive, current, deadline)
-            if not transport_lost and code is not None and self._loop.time() < deadline:
+            if not transport_lost and not self._transport_lost and code is not None and self._loop.time() < deadline:
                 try:
                     async with asyncio.timeout_at(deadline):
                         await self._transport.close(code)

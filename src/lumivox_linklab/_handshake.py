@@ -106,6 +106,10 @@ async def _open_client_websocket(config: ClientConfig) -> _ClientHandshake:
         if message.output_format not in client_hello.output_formats:
             raise CodecError("server selected an output format the client did not advertise")
         return _ClientHandshake(connection, client_hello, message)
+    except asyncio.CancelledError:
+        if connection.state is not State.CLOSED:
+            await connection.close(code=1000)
+        raise
     except BaseException:
         if connection.state is not State.CLOSED:
             await connection.close(code=1002)

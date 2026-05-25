@@ -243,6 +243,7 @@ class VoiceClient:
         self._callback_wake = asyncio.Event()
         self._closed = asyncio.Event()
         self._closed.set()
+        self._conversation_terminal = asyncio.Event()
         maximum_output_frames = max(format_.sample_rate_hz for format_ in config.output_formats)
         playback_capacity = max(1, maximum_output_frames * config.playback_queue_ms // 1_000)
         self._events = _CallbackQueue(
@@ -394,10 +395,26 @@ class VoiceClient:
         core = self._core
         if core is None:
             return
+        if core.outcome is not None:
+            await core.wait_closed()
+            monitor = self._monitor_task
+            if monitor is not None and monitor is not asyncio.current_task():
+                await monitor
+            return
+        shutdown_messages = self._ingress.prepare_shutdown()
         if self.connection_state in (ConnectionState.HANDSHAKING, ConnectionState.READY):
-            self._ingress.begin_close()
             self._queue_connection_state(ConnectionState.CLOSING)
-        await core.close(1000)
+        if shutdown_messages:
+            self._events.discard(lambda item: isinstance(item.message, OutputAudioEvent))
+            self._conversation_terminal.clear()
+            core.seal_orderly(shutdown_messages)
+            try:
+                async with asyncio.timeout(self._config.close_timeout_s / 2):
+                    await self._conversation_terminal.wait()
+            except TimeoutError:
+                pass
+        self._ingress.begin_close()
+        await core.close(1000, drain=bool(shutdown_messages))
         monitor = self._monitor_task
         if monitor is not None and monitor is not asyncio.current_task():
             await monitor
@@ -444,6 +461,7 @@ class VoiceClient:
                     await handoff
             self._output_format = None
             self._ingress.stop()
+            self._conversation_terminal.set()
             self._queue_connection_state(ConnectionState.DISCONNECTED, self._transport_reason())
             await self._stop_callback_dispatcher()
             self._closed.set()
@@ -456,6 +474,8 @@ class VoiceClient:
             core.discard_queued(lambda batch: self._is_unsent_input_audio(batch, message))
         if transition.dispatch:
             self._queue_callback(message, transition)
+        if isinstance(message, ConversationEndedEvent):
+            self._conversation_terminal.set()
 
     @staticmethod
     def _is_unsent_input_audio(batch: _OutboundBatch, closed: InputClosedEvent) -> bool:
@@ -478,7 +498,13 @@ class VoiceClient:
             return
         self._events.close()
         if task is not asyncio.current_task():
-            await task
+            try:
+                async with asyncio.timeout(self._config.close_timeout_s):
+                    await task
+            except TimeoutError:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         self._callback_task = None
 
     async def _run_callbacks(self) -> None:

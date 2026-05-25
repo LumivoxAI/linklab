@@ -113,6 +113,7 @@ class _ClientAudioIngress:
         self._pre_roll: deque[_AudioSpan] = deque()
         self._pre_roll_frames = 0
         self._confirmed_response_cancellations: set[ResponseId] = set()
+        self._shutting_down = False
 
     def transport_connected(self) -> None:
         with self._lock:
@@ -138,6 +139,46 @@ class _ClientAudioIngress:
             if self._validator.state.connection_state in (ConnectionState.HANDSHAKING, ConnectionState.READY):
                 self._validator.begin_close()
 
+    def prepare_shutdown(self) -> tuple[Message, ...]:
+        """Freeze ingress and create the single reserved shutdown batch."""
+        with self._lock:
+            if self._shutting_down:
+                return ()
+            self._shutting_down = True
+            data = self._validator._data
+            conversation = data.conversation
+            if data.connection_state is not ConnectionState.READY or conversation is None:
+                return ()
+            if conversation.cancel is not None or conversation.failure is not None:
+                return ()
+
+            messages: list[Message] = [
+                ConversationCancelledEvent(conversation.conversation_id, ConversationCancelReason.SHUTDOWN)
+            ]
+            response = self._validator._current_response(data, conversation)
+            if response is not None and response.output is not None and response.playback is None:
+                messages.append(
+                    PlaybackInterruptedEvent(
+                        conversation.conversation_id,
+                        response.start.response_id,
+                        response.output.start.output_id,
+                        0,
+                        PlaybackPosition.ESTIMATED,
+                        PlaybackInterruptReason.SHUTDOWN,
+                    )
+                )
+
+            candidate = data
+            for message in messages:
+                candidate, _ = self._validator._transition(candidate, message)
+            self._validator._data = candidate
+            self._batches.clear()
+            self._occupancy_frames = 0
+            self._control_occupancy = 0
+            self._notification_pending = False
+            self._clear_pre_roll_locked()
+            return tuple(messages)
+
     def stop(self) -> None:
         with self._lock:
             if self._validator.state.connection_state is not ConnectionState.DISCONNECTED:
@@ -151,6 +192,7 @@ class _ClientAudioIngress:
             self._notification_error = None
             self._generation = None
             self._confirmed_response_cancellations.clear()
+            self._shutting_down = False
             self._clear_pre_roll_locked()
 
     def submit(self, annotated: AnnotatedAudio) -> AudioSubmitResult:
@@ -168,7 +210,12 @@ class _ClientAudioIngress:
         with self._lock:
             data = self._validator._data
             input_ = self._open_input(data)
-            if data.connection_state is not ConnectionState.READY or input_ is None or self._failure is not None:
+            if (
+                data.connection_state is not ConnectionState.READY
+                or input_ is None
+                or self._failure is not None
+                or self._shutting_down
+            ):
                 return False
             message = InputAbortedEvent(input_.start.conversation_id, input_.start.input_id, reason)
             candidate, _ = self._validator._transition(data, message)
@@ -193,6 +240,7 @@ class _ClientAudioIngress:
                 or conversation.cancel is not None
                 or conversation.failure is not None
                 or self._failure is not None
+                or self._shutting_down
             ):
                 return False
             message = ConversationCancelledEvent(conversation.conversation_id, reason)
@@ -205,7 +253,12 @@ class _ClientAudioIngress:
         with self._lock:
             data = self._validator._data
             response = self._response_for_output(data, output_id)
-            if data.connection_state is not ConnectionState.READY or response is None or self._failure is not None:
+            if (
+                data.connection_state is not ConnectionState.READY
+                or response is None
+                or self._failure is not None
+                or self._shutting_down
+            ):
                 return False
             message = PlaybackFinishedEvent(
                 response.start.conversation_id,
@@ -232,7 +285,12 @@ class _ClientAudioIngress:
         with self._lock:
             data = self._validator._data
             response = self._response_for_output(data, output_id)
-            if data.connection_state is not ConnectionState.READY or response is None or self._failure is not None:
+            if (
+                data.connection_state is not ConnectionState.READY
+                or response is None
+                or self._failure is not None
+                or self._shutting_down
+            ):
                 return False
             message = PlaybackInterruptedEvent(
                 response.start.conversation_id,
@@ -308,7 +366,12 @@ class _ClientAudioIngress:
 
     def _submit_locked(self, annotated: AnnotatedAudio, audio: bytes) -> AudioSubmitResult:
         data = self._validator._data
-        if data.connection_state is not ConnectionState.READY or self._limits is None or self._failure is not None:
+        if (
+            data.connection_state is not ConnectionState.READY
+            or self._limits is None
+            or self._failure is not None
+            or self._shutting_down
+        ):
             return AudioSubmitResult.IGNORED_INACTIVE
 
         open_input = self._open_input(data)

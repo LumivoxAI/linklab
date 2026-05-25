@@ -541,6 +541,7 @@ class ServerSession:
         self._server_closed_inputs: set[InputId] = set()
         self._response_writer: ResponseWriter | None = None
         self._timeouts = _LifecycleTimeouts(self, config)
+        self._shutdown_task: asyncio.Task[None] | None = None
 
     def _set_handler(self, handler: ServerHandler) -> None:
         self._check_loop()
@@ -645,6 +646,68 @@ class ServerSession:
         if closed_input_id is not None:
             self._server_closed_inputs.add(closed_input_id)
         self._response_terminated(discard_output=True)
+
+    async def _shutdown(self) -> None:
+        self._check_loop()
+        if self._shutdown_task is None:
+            self._shutdown_task = self._loop.create_task(
+                self._shutdown_impl(),
+                name="linklab-server-session-close",
+            )
+        await asyncio.shield(self._shutdown_task)
+
+    async def _shutdown_impl(self) -> None:
+        self._timeouts.close()
+        if self._core.outcome is not None:
+            await self._close_dispatcher()
+            await self._core.wait_closed()
+            return
+        messages: list[Message] = []
+        closed_input_id: InputId | None = None
+        validator = self._core.validator
+        conversation = validator._data.conversation
+        if validator.state.connection_state is ConnectionState.READY and conversation is not None:
+            input_ = validator._current_input(validator._data, conversation)
+            if input_ is not None:
+                if input_.terminal is None:
+                    messages.append(
+                        InputClosedEvent(
+                            conversation.conversation_id,
+                            input_.start.input_id,
+                            input_.committed_end_frame,
+                            InputCloseReason.FAILED,
+                        )
+                    )
+                    closed_input_id = input_.start.input_id
+                if input_.transcript_final is None:
+                    messages.append(TranscriptFinalEvent(conversation.conversation_id, input_.start.input_id, ""))
+            response = validator._current_response(validator._data, conversation)
+            if response is not None:
+                messages.append(
+                    ResponseCancelledEvent(
+                        conversation.conversation_id,
+                        response.start.response_id,
+                        ResponseCancelReason.SHUTDOWN,
+                    )
+                )
+            messages.append(ConversationEndedEvent(conversation.conversation_id, ConversationEndReason.CANCELLED))
+
+        if messages:
+            self._response_terminated(discard_output=True)
+            self._core.seal_orderly(tuple(messages))
+            if closed_input_id is not None:
+                self._server_closed_inputs.add(closed_input_id)
+        await self._close_dispatcher()
+        await self._core.close(1001, drain=bool(messages))
+
+    def _transport_lost(self) -> None:
+        """Invalidate loop-owned application work without attempting wire delivery."""
+        self._timeouts.close()
+        self._response_terminated(discard_output=True)
+        self._events.close()
+        task = self._dispatcher_task
+        if task is not None and not task.done():
+            task.cancel()
 
     async def fail(self, scope: ErrorScope, code: ErrorCode, message: str | None = None) -> None:
         self._check_loop()
@@ -1163,6 +1226,10 @@ class VoiceServer:
                 assert session is not None
                 session._accept_inbound(message, transition)
 
+            def transport_lost(_error: BaseException) -> None:
+                if session is not None:
+                    session._transport_lost()
+
             core = _TransportCore(
                 connection,
                 role=EndpointRole.SERVER,
@@ -1171,7 +1238,7 @@ class VoiceServer:
                 control_capacity=_CONTROL_CAPACITY,
                 close_timeout_s=self._config.close_timeout_s,
                 on_transition=accept_inbound,
-                on_transport_loss=self._ignore_transport_loss,
+                on_transport_loss=transport_lost,
                 ping_interval_s=self._config.ping_interval_s,
                 ping_timeout_s=self._config.ping_timeout_s,
                 occupancy_unit="frames",
@@ -1220,8 +1287,11 @@ class VoiceServer:
                     await serve_task
             self._closed.set()
             return
-        listener.close()
         try:
+            sessions = tuple(self._sessions)
+            if sessions:
+                await asyncio.gather(*(session._shutdown() for session in sessions))
+            listener.close()
             await listener.wait_closed()
         finally:
             self._listener = None
@@ -1234,7 +1304,3 @@ class VoiceServer:
             raise RuntimeError("VoiceServer operation requires its event loop") from error
         if loop is not self._loop:
             raise RuntimeError("VoiceServer is bound to a different event loop")
-
-    @staticmethod
-    def _ignore_transport_loss(_error: BaseException) -> None:
-        return None

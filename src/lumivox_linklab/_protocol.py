@@ -726,6 +726,9 @@ class ProtocolValidator:
         updated = self._replace_response(data, updated_response)
         if isinstance(response.terminal, ResponseCancelledEvent):
             return updated, self._result(message, terminal=True)
+        conversation = self._require_conversation(data, message.conversation_id)
+        if conversation.cancel is not None:
+            return updated, self._result(message, terminal=True)
 
         if message.reason in (PlaybackInterruptReason.PLAYBACK_FAILED, PlaybackInterruptReason.OVERFLOW):
             if self._role is EndpointRole.SERVER:
