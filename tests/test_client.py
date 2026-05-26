@@ -222,6 +222,122 @@ def assert_disconnected(client: linklab.VoiceClient) -> None:
     assert client.output_format is None
 
 
+def test_orderly_client_shutdown_sends_one_terminal_batch_and_waits_for_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        connection = FakeConnection()
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            return fake_handshake(connection)
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        client = linklab.VoiceClient(
+            linklab.ClientConfig("ws://unused", (PCM_16K,), close_timeout_s=0.2),
+            NullCallbacks(),
+            object(),
+        )
+        await client.connect()
+        await open_input(client, connection)
+
+        closing = asyncio.create_task(client.close())
+        await wait_for_sent(connection, 4)
+        assert not closing.done()
+        assert linklab.decode_message(
+            connection.sent[-1],
+            direction=linklab.MessageDirection.CLIENT_TO_SERVER,
+            limits=linklab.ConnectionLimits(max_output_audio_frames=1_600),
+        ) == linklab.ConversationCancelledEvent(
+            linklab.ConversationId(1),
+            linklab.ConversationCancelReason.SHUTDOWN,
+        )
+
+        await send_server(
+            connection,
+            linklab.ConversationEndedEvent(
+                linklab.ConversationId(1),
+                linklab.ConversationEndReason.CANCELLED,
+            ),
+        )
+        await asyncio.gather(closing, client.close())
+        assert connection.close_codes == [1000]
+        assert_disconnected(client)
+
+    run(scenario())
+
+
+def test_orderly_client_shutdown_accounts_started_output_after_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        connection = FakeConnection()
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            return fake_handshake(connection)
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        client = linklab.VoiceClient(
+            linklab.ClientConfig("ws://unused", (PCM_16K,), close_timeout_s=0.2),
+            NullCallbacks(),
+            object(),
+        )
+        await client.connect()
+        await open_input(client, connection)
+        await start_response(connection)
+        await send_server(
+            connection,
+            linklab.OutputStartedEvent(
+                linklab.ConversationId(1),
+                linklab.ResponseId(1),
+                linklab.OutputId(1),
+            ),
+        )
+        async with asyncio.timeout(1):
+            while client._ingress.state.output_id is None:
+                await asyncio.sleep(0)
+
+        closing = asyncio.create_task(client.close())
+        await wait_for_sent(connection, 5)
+        terminal = [
+            linklab.decode_message(
+                frame,
+                direction=linklab.MessageDirection.CLIENT_TO_SERVER,
+                limits=linklab.ConnectionLimits(max_output_audio_frames=1_600),
+            )
+            for frame in connection.sent[-2:]
+        ]
+        assert terminal == [
+            linklab.ConversationCancelledEvent(
+                linklab.ConversationId(1),
+                linklab.ConversationCancelReason.SHUTDOWN,
+            ),
+            linklab.PlaybackInterruptedEvent(
+                linklab.ConversationId(1),
+                linklab.ResponseId(1),
+                linklab.OutputId(1),
+                0,
+                linklab.PlaybackPosition.ESTIMATED,
+                linklab.PlaybackInterruptReason.SHUTDOWN,
+            ),
+        ]
+        await send_server(
+            connection,
+            linklab.ResponseCancelledEvent(
+                linklab.ConversationId(1),
+                linklab.ResponseId(1),
+                linklab.ResponseCancelReason.CONVERSATION_CANCELLED,
+            ),
+            linklab.ConversationEndedEvent(
+                linklab.ConversationId(1),
+                linklab.ConversationEndReason.CANCELLED,
+            ),
+        )
+        await closing
+        assert connection.close_codes == [1000]
+
+    run(scenario())
+
+
 def test_loopback_facade_handoffs_capture_thread_control_and_closes_idempotently() -> None:
     async def scenario() -> None:
         port = unused_port()

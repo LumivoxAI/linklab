@@ -117,6 +117,34 @@ async def close_pair(server: Any, client: Any) -> None:
     await server.close()
 
 
+def test_server_shutdown_cancels_response_and_invalidates_output_writer() -> None:
+    async def scenario() -> None:
+        server, client, session, conversation_id, input_id = await open_ready_session()
+        response = await session.start_response(input_id)
+        output = await response.start_output()
+        await output.send_audio(b"\x01\x02")
+        await receive_messages(client, 4)
+
+        closing = asyncio.create_task(server.close())
+        assert await receive_messages(client, 2) == [
+            linklab.ResponseCancelledEvent(
+                conversation_id,
+                linklab.ResponseId(1),
+                linklab.ResponseCancelReason.SHUTDOWN,
+            ),
+            linklab.ConversationEndedEvent(conversation_id, linklab.ConversationEndReason.CANCELLED),
+        ]
+        with pytest.raises(linklab.WriterClosed):
+            await output.send_audio(b"\x03\x04")
+        with pytest.raises(linklab.WriterClosed):
+            await response.finish()
+        await closing
+        await client.connection.wait_closed()
+        assert client.connection.close_code == 1001
+
+    run(scenario())
+
+
 def test_response_writer_sequences_text_and_finishes_without_output() -> None:
     async def scenario() -> None:
         server, client, session, conversation_id, input_id = await open_ready_session()
