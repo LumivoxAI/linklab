@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from enum import StrEnum
+from random import random as _random
 from typing import Self, Protocol, runtime_checkable
 from threading import Lock
 from contextlib import suppress
 from collections import deque
 from dataclasses import dataclass
 from collections.abc import Callable
+
+from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
 
 from ._enums import (
     EndpointRole,
@@ -265,6 +268,7 @@ class VoiceClient:
         self._callback_task: asyncio.Task[None] | None = None
         self._monitor_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._reconnect_stop = asyncio.Event()
         self._connect_started = False
         self._output_format: AudioFormat | None = None
         self._transport_loss: BaseException | None = None
@@ -284,54 +288,17 @@ class VoiceClient:
             raise RuntimeError("VoiceClient.connect() may only be called once")
         self._connect_started = True
         self._close_task = None
+        self._reconnect_stop.clear()
         self._closed.clear()
-        self._ingress.transport_connected()
         self._start_callback_dispatcher()
-        self._queue_connection_state(ConnectionState.HANDSHAKING)
         current = asyncio.current_task()
         assert current is not None
         self._connect_task = current
-        core: _TransportCore | None = None
         try:
-            handshake = await _open_client_websocket(self._config)
-            core = _TransportCore(
-                handshake.connection,
-                role=EndpointRole.CLIENT,
-                limits=handshake.server_hello.limits,
-                data_capacity=self._config.input_queue_frames,
-                control_capacity=_CONTROL_CAPACITY,
-                close_timeout_s=self._config.close_timeout_s,
-                on_transition=self._accept_inbound,
-                on_transport_loss=self._record_transport_loss,
-                ping_interval_s=self._config.ping_interval_s,
-                ping_timeout_s=self._config.ping_timeout_s,
-                on_outbound_space=self._wake.set,
-                occupancy_unit="frames",
-            )
-            self._core = core
-            self._ingress.complete_handshake(handshake.client_hello, handshake.server_hello)
-            self._output_format = handshake.server_hello.output_format
-            playback_capacity = max(
-                1,
-                handshake.server_hello.output_format.sample_rate_hz * self._config.playback_queue_ms // 1_000,
-            )
-            self._events.set_output_capacity(playback_capacity)
-            core.start_handshaken(handshake.client_hello, handshake.server_hello)
-            self._handoff_task = self._loop.create_task(self._run_handoff(), name="linklab-client-handoff")
-            self._monitor_task = self._loop.create_task(self._monitor_transport(), name="linklab-client-monitor")
-            self._wake.set()
-            self._queue_connection_state(ConnectionState.READY)
-            if self._local_failure is not None:
-                core._request_close(1011, drain=False, loss=self._local_failure)
+            await self._establish_connection()
+            self._monitor_task = self._loop.create_task(self._monitor_connections(), name="linklab-client-monitor")
         except BaseException:
-            if core is not None:
-                with suppress(Exception):
-                    await core.close(1011)
-            self._output_format = None
-            self._ingress.stop()
-            self._queue_connection_state(ConnectionState.DISCONNECTED)
-            await self._stop_callback_dispatcher()
-            self._closed.set()
+            await self._finish()
             raise
         finally:
             self._connect_task = None
@@ -382,6 +349,7 @@ class VoiceClient:
         return False
 
     async def _close(self) -> None:
+        self._reconnect_stop.set()
         connect_task = self._connect_task
         if self.connection_state is ConnectionState.HANDSHAKING and connect_task is not None:
             self._ingress.begin_close()
@@ -394,6 +362,14 @@ class VoiceClient:
 
         core = self._core
         if core is None:
+            monitor = self._monitor_task
+            if monitor is not None and monitor is not asyncio.current_task():
+                if self.connection_state is ConnectionState.HANDSHAKING:
+                    self._ingress.begin_close()
+                    self._queue_connection_state(ConnectionState.CLOSING)
+                    monitor.cancel()
+                with suppress(asyncio.CancelledError):
+                    await monitor
             return
         if core.outcome is not None:
             await core.wait_closed()
@@ -448,23 +424,123 @@ class VoiceClient:
         except Exception:
             await core.close(1011)
 
-    async def _monitor_transport(self) -> None:
-        core = self._core
-        assert core is not None
+    async def _monitor_connections(self) -> None:
+        backoff = self._config.reconnect_initial_s
         try:
-            await core.wait_closed()
+            while True:
+                core = self._core
+                assert core is not None
+                await core.wait_closed()
+                outcome = core.outcome
+                await self._cleanup_connection(core)
+                self._queue_connection_state(ConnectionState.DISCONNECTED, self._transport_reason())
+
+                if (
+                    self._reconnect_stop.is_set()
+                    or self._local_failure is not None
+                    or not self._config.reconnect
+                    or outcome is None
+                    or not outcome.reconnect_eligible
+                ):
+                    return
+
+                while True:
+                    if not await self._wait_reconnect_delay(_random() * backoff):
+                        return
+                    if self._reconnect_stop.is_set():
+                        return
+                    backoff = min(backoff * 2, self._config.reconnect_max_s)
+                    try:
+                        await self._establish_connection()
+                    except asyncio.CancelledError:
+                        raise
+                    except BaseException as error:
+                        self._transport_loss = error
+                        if not _reconnect_failure_eligible(error):
+                            return
+                        continue
+                    backoff = self._config.reconnect_initial_s
+                    break
         finally:
-            handoff = self._handoff_task
-            if handoff is not None and handoff is not asyncio.current_task() and not handoff.done():
-                handoff.cancel()
-                with suppress(asyncio.CancelledError):
-                    await handoff
+            await self._finish()
+
+    async def _establish_connection(self) -> None:
+        self._transport_loss = None
+        self._ingress.transport_connected()
+        self._queue_connection_state(ConnectionState.HANDSHAKING)
+        core: _TransportCore | None = None
+        try:
+            handshake = await _open_client_websocket(self._config)
+            core = _TransportCore(
+                handshake.connection,
+                role=EndpointRole.CLIENT,
+                limits=handshake.server_hello.limits,
+                data_capacity=self._config.input_queue_frames,
+                control_capacity=_CONTROL_CAPACITY,
+                close_timeout_s=self._config.close_timeout_s,
+                on_transition=self._accept_inbound,
+                on_transport_loss=self._record_transport_loss,
+                ping_interval_s=self._config.ping_interval_s,
+                ping_timeout_s=self._config.ping_timeout_s,
+                on_outbound_space=self._wake.set,
+                occupancy_unit="frames",
+            )
+            self._core = core
+            self._ingress.complete_handshake(handshake.client_hello, handshake.server_hello)
+            self._output_format = handshake.server_hello.output_format
+            playback_capacity = max(
+                1,
+                handshake.server_hello.output_format.sample_rate_hz * self._config.playback_queue_ms // 1_000,
+            )
+            self._events.set_output_capacity(playback_capacity)
+            core.start_handshaken(handshake.client_hello, handshake.server_hello)
+            self._handoff_task = self._loop.create_task(self._run_handoff(), name="linklab-client-handoff")
+            self._wake.set()
+            self._queue_connection_state(ConnectionState.READY)
+            if self._local_failure is not None:
+                core._request_close(1011, drain=False, loss=self._local_failure)
+        except BaseException as error:
+            self._transport_loss = error
+            if core is not None:
+                with suppress(Exception):
+                    await core.close(1011)
+            if self._core is core:
+                self._core = None
             self._output_format = None
             self._ingress.stop()
-            self._conversation_terminal.set()
             self._queue_connection_state(ConnectionState.DISCONNECTED, self._transport_reason())
-            await self._stop_callback_dispatcher()
-            self._closed.set()
+            raise
+
+    async def _cleanup_connection(self, core: _TransportCore) -> None:
+        handoff = self._handoff_task
+        if handoff is not None and handoff is not asyncio.current_task() and not handoff.done():
+            handoff.cancel()
+            with suppress(asyncio.CancelledError):
+                await handoff
+        self._handoff_task = None
+        self._events.discard(lambda item: not isinstance(item.message, ConnectionStateEvent))
+        self._output_format = None
+        self._ingress.stop()
+        self._conversation_terminal.set()
+        if self._core is core:
+            self._core = None
+
+    async def _wait_reconnect_delay(self, delay: float) -> bool:
+        try:
+            async with asyncio.timeout(delay):
+                await self._reconnect_stop.wait()
+        except TimeoutError:
+            return True
+        return False
+
+    async def _finish(self) -> None:
+        core = self._core
+        if core is not None:
+            await self._cleanup_connection(core)
+            if self.connection_state is not ConnectionState.DISCONNECTED:
+                self._queue_connection_state(ConnectionState.DISCONNECTED, self._transport_reason())
+        await self._stop_callback_dispatcher()
+        self._closed.set()
 
     def _accept_inbound(self, message: Message, _transport_transition: _TransitionResult) -> None:
         transition = self._ingress.accept_inbound(message)
@@ -606,6 +682,7 @@ class VoiceClient:
     def _request_implementation_close(self, error: BaseException) -> None:
         if self._local_failure is None:
             self._local_failure = error
+        self._reconnect_stop.set()
         core = self._core
         if core is not None:
             core._request_close(1011, drain=False, loss=self._local_failure)
@@ -670,3 +747,12 @@ class VoiceClient:
             raise RuntimeError("VoiceClient operation requires its event loop") from error
         if loop is not self._loop:
             raise RuntimeError("VoiceClient is bound to a different event loop")
+
+
+def _reconnect_failure_eligible(error: BaseException) -> bool:
+    if isinstance(error, WebSocketConnectionClosed):
+        received = error.rcvd
+        sent = error.sent
+        code = received.code if received is not None else None if sent is None else sent.code
+        return code in (None, 1001, 1006)
+    return isinstance(error, (OSError, TimeoutError))
