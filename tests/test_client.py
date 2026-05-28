@@ -896,3 +896,172 @@ def test_client_transport_control_exhaustion_closes_1011(monkeypatch: pytest.Mon
         assert core.snapshots()[1].overflow_count == 1
 
     run(scenario())
+
+
+def test_reconnect_backoff_cleanup_fresh_state_and_close_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        first = FakeConnection()
+        second = FakeConnection()
+        connections = iter((fake_handshake(first), OSError("retry failed"), fake_handshake(second)))
+        open_count = 0
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            nonlocal open_count
+            open_count += 1
+            result = next(connections)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        random_values = iter((0.5, 0.75, 0.25))
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        monkeypatch.setattr("lumivox_linklab._client._random", lambda: next(random_values))
+
+        callbacks = RecordingCallbacks()
+        client = linklab.VoiceClient(
+            linklab.ClientConfig(
+                "ws://unused",
+                (PCM_16K,),
+                reconnect=True,
+                reconnect_initial_s=2.0,
+                reconnect_max_s=3.0,
+            ),
+            callbacks,
+            object(),
+        )
+        delays: list[float] = []
+        third_delay = asyncio.Event()
+
+        async def wait_delay(delay: float) -> bool:
+            delays.append(delay)
+            async with asyncio.timeout(1):
+                while not any(
+                    isinstance(event, linklab.ConnectionStateEvent)
+                    and event.state is linklab.ConnectionState.DISCONNECTED
+                    for event in callbacks.events
+                ):
+                    await asyncio.sleep(0)
+            assert client.connection_state is linklab.ConnectionState.DISCONNECTED
+            assert (
+                client.submit_annotated_audio(linklab.AnnotatedAudio(b"\x01\x02", 0, False, True, True))
+                is linklab.AudioSubmitResult.IGNORED_INACTIVE
+            )
+            if len(delays) == 3:
+                third_delay.set()
+                await client._reconnect_stop.wait()
+                return False
+            return True
+
+        monkeypatch.setattr(client, "_wait_reconnect_delay", wait_delay)
+        await client.connect()
+        await open_input(client, first)
+        first_core = client._core
+        assert first_core is not None
+        first_core._request_close(1001, drain=False)
+
+        async with asyncio.timeout(1):
+            while client.connection_state is not linklab.ConnectionState.READY or open_count < 3:
+                await asyncio.sleep(0)
+        assert second.sent == []
+        assert (
+            client.submit_annotated_audio(linklab.AnnotatedAudio(b"\x03\x04", 1, False, True, True))
+            is linklab.AudioSubmitResult.ACCEPTED
+        )
+        await wait_for_sent(second, 3)
+        restarted = [
+            linklab.decode_message(
+                frame,
+                direction=linklab.MessageDirection.CLIENT_TO_SERVER,
+                limits=linklab.ConnectionLimits(max_output_audio_frames=1_600),
+            )
+            for frame in second.sent
+        ]
+        assert cast(linklab.ConversationStartedEvent, restarted[0]).conversation_id == 1
+        assert cast(linklab.InputStartedEvent, restarted[1]).input_id == 1
+        assert cast(linklab.InputAudioEvent, restarted[2]).audio == b"\x03\x04"
+
+        second_core = client._core
+        assert second_core is not None
+        second_core._request_close(1001, drain=False)
+        await third_delay.wait()
+        await client.close()
+
+        assert delays == [1.0, 2.25, 0.5]
+        assert open_count == 3
+        assert_disconnected(client)
+        assert client._callback_task is None
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("close_code", [1002, 1008])
+def test_reconnect_is_not_attempted_after_policy_or_protocol_close(
+    monkeypatch: pytest.MonkeyPatch,
+    close_code: int,
+) -> None:
+    async def scenario() -> None:
+        connection = FakeConnection()
+        open_count = 0
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            nonlocal open_count
+            open_count += 1
+            return fake_handshake(connection)
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        client = linklab.VoiceClient(
+            linklab.ClientConfig("ws://unused", (PCM_16K,), reconnect=True),
+            NullCallbacks(),
+            object(),
+        )
+        await client.connect()
+        core = client._core
+        assert core is not None
+        core._request_close(close_code, drain=False)
+        await client.wait_closed()
+
+        assert open_count == 1
+        assert_disconnected(client)
+
+    run(scenario())
+
+
+def test_close_cancels_reconnect_handshake(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def scenario() -> None:
+        connection = FakeConnection()
+        reconnect_started = asyncio.Event()
+        reconnect_cancelled = asyncio.Event()
+        open_count = 0
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            nonlocal open_count
+            open_count += 1
+            if open_count == 1:
+                return fake_handshake(connection)
+            reconnect_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                reconnect_cancelled.set()
+            raise AssertionError("unreachable")
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        monkeypatch.setattr("lumivox_linklab._client._random", lambda: 0.0)
+        client = linklab.VoiceClient(
+            linklab.ClientConfig("ws://unused", (PCM_16K,), reconnect=True),
+            NullCallbacks(),
+            object(),
+        )
+        await client.connect()
+        core = client._core
+        assert core is not None
+        core._request_transport_loss(OSError("connection lost"), None)
+        await reconnect_started.wait()
+
+        await client.close()
+
+        assert reconnect_cancelled.is_set()
+        assert open_count == 2
+        assert_disconnected(client)
+
+    run(scenario())
