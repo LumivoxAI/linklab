@@ -16,6 +16,7 @@ from ._errors import CodecError, QueueOverflow, ConnectionClosed, ProtocolViolat
 from ._values import InputId
 from ._messages import Message, ErrorEvent, ClientHello, ServerHello
 from ._protocol import ProtocolValidator, _TransitionResult
+from ._observability import _Observer, _QueueSnapshot, _lifecycle_boundary, _MessageObservation
 
 
 class _FrameTransport(Protocol):
@@ -34,16 +35,6 @@ class _QueueLane(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class _QueueSnapshot:
-    identity: str
-    capacity: int
-    occupancy: int
-    overflow_count: int
-    oldest_residence_ms: float
-    occupancy_unit: str
-
-
-@dataclass(frozen=True, slots=True)
 class _OutboundBatch:
     frames: tuple[bytes, ...]
     lane: _QueueLane
@@ -51,6 +42,7 @@ class _OutboundBatch:
     enqueued_at: float
     tag: object | None = None
     terminal: bool = False
+    observations: tuple[_MessageObservation, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +91,7 @@ class _BoundedBatchQueue:
         lane: _QueueLane,
         weight: int,
         tag: object | None = None,
+        observations: tuple[_MessageObservation, ...] = (),
     ) -> None:
         if self._closed:
             raise ConnectionClosed("transport queue is closed")
@@ -111,7 +104,7 @@ class _BoundedBatchQueue:
         if self._occupancy[lane] + weight > self._capacities[lane]:
             self._overflows[lane] += 1
             raise QueueOverflow(f"{self._identity} {lane.value} capacity exceeded")
-        self._items.append(_OutboundBatch(frames, lane, weight, self._clock(), tag))
+        self._items.append(_OutboundBatch(frames, lane, weight, self._clock(), tag, observations=observations))
         self._occupancy[lane] += weight
         self._available.set()
 
@@ -150,7 +143,11 @@ class _BoundedBatchQueue:
             self.discard(lambda _item: True)
         self._available.set()
 
-    def seal(self, terminal_frames: tuple[bytes, ...] = ()) -> None:
+    def seal(
+        self,
+        terminal_frames: tuple[bytes, ...] = (),
+        observations: tuple[_MessageObservation, ...] = (),
+    ) -> None:
         if self._closed:
             return
         self.discard(lambda _item: True)
@@ -162,6 +159,7 @@ class _BoundedBatchQueue:
                     len(terminal_frames),
                     self._clock(),
                     terminal=True,
+                    observations=observations,
                 )
             )
             self._occupancy[_QueueLane.CONTROL] += len(terminal_frames)
@@ -177,7 +175,7 @@ class _BoundedBatchQueue:
             occupancy=self._occupancy[lane],
             overflow_count=self._overflows[lane],
             oldest_residence_ms=residence,
-            occupancy_unit=self._occupancy_unit,
+            occupancy_unit="messages" if lane is _QueueLane.CONTROL else self._occupancy_unit,
         )
 
 
@@ -205,6 +203,7 @@ class _TransportCore:
         on_outbound_space: _SpaceHook | None = None,
         occupancy_unit: str = "units",
         clock: Callable[[], float] | None = None,
+        observer: _Observer | None = None,
     ) -> None:
         try:
             self._loop = asyncio.get_running_loop()
@@ -230,13 +229,15 @@ class _TransportCore:
         self._on_transport_loss = on_transport_loss
         self._on_rtt = on_rtt
         self._on_outbound_space = on_outbound_space
+        self._observer = observer
+        self._clock = clock or self._loop.time
         self._validator = ProtocolValidator(role)
         self._queue = _BoundedBatchQueue(
-            identity="outbound",
+            identity=f"{role.value}.transport_outbound",
             data_capacity=data_capacity,
             control_capacity=control_capacity,
             occupancy_unit=occupancy_unit,
-            clock=clock or self._loop.time,
+            clock=self._clock,
         )
         self._reader_task: asyncio.Task[None] | None = None
         self._writer_task: asyncio.Task[None] | None = None
@@ -265,6 +266,7 @@ class _TransportCore:
         self._reader_task = self._loop.create_task(self._reader(), name="linklab-transport-reader")
         self._writer_task = self._loop.create_task(self._writer(), name="linklab-transport-writer")
         self._keepalive_task = self._loop.create_task(self._keepalive(), name="linklab-transport-keepalive")
+        self._observe_queues("transport_started")
 
     def start_handshaken(self, client_hello: ClientHello, server_hello: ServerHello) -> None:
         self._check_loop()
@@ -278,6 +280,7 @@ class _TransportCore:
         self._reader_task = self._loop.create_task(self._reader(), name="linklab-transport-reader")
         self._writer_task = self._loop.create_task(self._writer(), name="linklab-transport-writer")
         self._keepalive_task = self._loop.create_task(self._keepalive(), name="linklab-transport-keepalive")
+        self._observe_queues("handshake_complete")
 
     def set_limits(self, limits: ConnectionLimits) -> None:
         self._check_loop()
@@ -310,12 +313,34 @@ class _TransportCore:
             wire_messages.append(message)
             wire_messages.extend(result.outbound)
         frames = tuple(_encode_message_with_limits(message, self._limits) for message in wire_messages)
-        self._queue.put_nowait(frames, lane=lane, weight=len(frames) if weight is None else weight, tag=tag)
+        observations = (
+            () if self._observer is None else tuple(self._observer.project(message) for message in wire_messages)
+        )
+        try:
+            self._queue.put_nowait(
+                frames,
+                lane=lane,
+                weight=len(frames) if weight is None else weight,
+                tag=tag,
+                observations=observations,
+            )
+        except QueueOverflow:
+            self._observe_queues()
+            raise
         self._validator._data = data
+        if self._observer is not None:
+            for message in wire_messages:
+                self._observer.message(message, direction="outbound", phase="queued")
+        boundary = next((value for item in wire_messages if (value := _lifecycle_boundary(item)) is not None), None)
+        self._observe_queues(boundary)
 
     def snapshots(self) -> tuple[_QueueSnapshot, _QueueSnapshot]:
         self._check_loop()
         return (self._queue.snapshot(_QueueLane.DATA), self._queue.snapshot(_QueueLane.CONTROL))
+
+    def observe_queues(self, boundary: str) -> None:
+        self._check_loop()
+        self._observe_queues(boundary)
 
     def discard_queued(self, predicate: Callable[[_OutboundBatch], bool]) -> tuple[_OutboundBatch, ...]:
         self._check_loop()
@@ -338,8 +363,15 @@ class _TransportCore:
             wire_messages.append(message)
             wire_messages.extend(result.outbound)
         frames = tuple(_encode_message_with_limits(message, self._limits) for message in wire_messages)
-        self._queue.seal(frames)
+        observations = (
+            () if self._observer is None else tuple(self._observer.project(message) for message in wire_messages)
+        )
+        self._queue.seal(frames, observations)
         self._validator._data = data
+        if self._observer is not None:
+            for message in wire_messages:
+                self._observer.message(message, direction="outbound", phase="queued")
+        self._observe_queues("orderly_terminal")
 
     def commit_input_audio(
         self,
@@ -365,8 +397,21 @@ class _TransportCore:
                     wire_messages.append(message)
                     wire_messages.extend(result.outbound)
                 frames = tuple(_encode_message_with_limits(message, self._limits) for message in wire_messages)
-                self._queue.put_nowait(frames, lane=_QueueLane.CONTROL, weight=len(frames))
+                observations = (
+                    ()
+                    if self._observer is None
+                    else tuple(self._observer.project(message) for message in wire_messages)
+                )
+                self._queue.put_nowait(
+                    frames,
+                    lane=_QueueLane.CONTROL,
+                    weight=len(frames),
+                    observations=observations,
+                )
                 self._validator._data = data
+                if self._observer is not None:
+                    for message in wire_messages:
+                        self._observer.message(message, direction="outbound", phase="queued")
             elif following:
                 raise ValueError("following messages require an input terminal")
             return messages
@@ -433,6 +478,9 @@ class _TransportCore:
                     encoded = tuple(_encode_message_with_limits(item, self._limits) for item in result.outbound)
                     self._queue.put_nowait(encoded, lane=_QueueLane.CONTROL, weight=len(encoded))
                 self._validator._data = data
+                if self._observer is not None:
+                    self._observer.message(message, direction="inbound", phase="received")
+                self._observe_queues(_lifecycle_boundary(message))
                 try:
                     self._on_transition(message, result)
                 except Exception as error:
@@ -452,15 +500,23 @@ class _TransportCore:
         try:
             while True:
                 batch = await self._queue.get()
+                self._observe_queues()
                 if self._on_outbound_space is not None:
                     try:
                         self._on_outbound_space()
                     except Exception:
                         pass
-                for frame in batch.frames:
+                for index, frame in enumerate(batch.frames):
                     if self._fatal and not batch.terminal:
                         break
                     await self._transport.send(frame)
+                    if self._observer is not None and index < len(batch.observations):
+                        self._observer.projected(
+                            batch.observations[index],
+                            direction="outbound",
+                            phase="sent",
+                            transport_queue_ms=(self._clock() - batch.enqueued_at) * 1_000,
+                        )
         except asyncio.CancelledError:
             raise
         except ConnectionClosed:
@@ -490,6 +546,8 @@ class _TransportCore:
                         self._on_rtt(float(rtt))
                     except Exception:
                         pass
+                if self._observer is not None:
+                    self._observer.rtt(float(rtt))
         except asyncio.CancelledError:
             raise
         except WebSocketConnectionClosed as error:
@@ -511,7 +569,15 @@ class _TransportCore:
             except Exception as encoding_error:
                 if cause is None:
                     cause = encoding_error
-        self._queue.seal(terminal_frames)
+        observations = (
+            ()
+            if self._observer is None or not terminal_frames
+            else (self._observer.project(ErrorEvent(ErrorScope.CONNECTION, code, True)),)
+        )
+        self._queue.seal(terminal_frames, observations)
+        if self._observer is not None:
+            self._observer.failure("transport_protocol_fatal", cause, code=code.value)
+        self._observe_queues("protocol_fatal")
         return self._request_close(1002, drain=True, loss=cause)
 
     def _request_transport_loss(self, error: BaseException, close_code: int | None) -> asyncio.Task[None]:
@@ -524,6 +590,9 @@ class _TransportCore:
             error=error,
         )
         self._queue.close(discard=True)
+        if self._observer is not None:
+            self._observer.failure("transport_lost", error, close_code=close_code)
+        self._observe_queues("transport_lost")
         if self._close_task is not None:
             return self._close_task
         self._closing = True
@@ -545,6 +614,8 @@ class _TransportCore:
         self._closing = True
         self._loss = loss
         self._outcome = _TransportOutcome(code, abnormal=False, reconnect_eligible=code == 1001, error=loss)
+        if self._observer is not None:
+            self._observer.lifecycle("transport_closing", close_code=code, drain=drain)
         if self._validator.state.connection_state in (ConnectionState.HANDSHAKING, ConnectionState.READY):
             self._validator.begin_close()
         self._close_task = self._loop.create_task(
@@ -596,6 +667,7 @@ class _TransportCore:
                 except Exception:
                     pass
             self._closed.set()
+            self._observe_queues("transport_disconnected")
 
     async def _join_task(
         self,
@@ -617,6 +689,13 @@ class _TransportCore:
         if self._role is EndpointRole.CLIENT:
             return MessageDirection.SERVER_TO_CLIENT
         return MessageDirection.CLIENT_TO_SERVER
+
+    def _observe_queues(self, boundary: str | None = None) -> None:
+        if self._observer is not None:
+            self._observer.queue_snapshots(
+                (self._queue.snapshot(_QueueLane.DATA), self._queue.snapshot(_QueueLane.CONTROL)),
+                boundary=boundary,
+            )
 
 
 def _websocket_close_code(error: WebSocketConnectionClosed) -> int | None:

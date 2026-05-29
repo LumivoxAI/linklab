@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import StrEnum
+from time import monotonic
 from typing import Final
 from threading import Lock
 from collections import deque
@@ -46,6 +47,7 @@ from ._messages import (
     ConversationCancelledEvent,
 )
 from ._protocol import ProtocolValidator, _Input, _Response, _ValidatorData, _TransitionResult
+from ._observability import _QueueSnapshot
 
 _MAX_SEQUENCE: Final = 4_294_967_295
 
@@ -61,6 +63,7 @@ class _IngressBatch:
     lane: _IngressLane
     audio_frames: int
     input_id: InputId | None
+    enqueued_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +79,7 @@ class _IngressSnapshot:
 class _AudioSpan:
     audio: bytes
     speech: bool
+    retained_at: float = 0.0
 
     @property
     def frames(self) -> int:
@@ -91,6 +95,7 @@ class _ClientAudioIngress:
         *,
         notify: Callable[[], None] | None = None,
         control_capacity: int = 16,
+        clock: Callable[[], float] = monotonic,
     ) -> None:
         if not isinstance(config, ClientConfig):
             raise TypeError("config must be ClientConfig")
@@ -99,6 +104,7 @@ class _ClientAudioIngress:
         self._config = config
         self._notify = notify
         self._control_capacity = control_capacity
+        self._clock = clock
         self._lock = Lock()
         self._validator = ProtocolValidator(EndpointRole.CLIENT)
         self._limits: ConnectionLimits | None = None
@@ -106,6 +112,8 @@ class _ClientAudioIngress:
         self._occupancy_frames = 0
         self._control_occupancy = 0
         self._overflow_count = 0
+        self._control_overflow_count = 0
+        self._pre_roll_trim_count = 0
         self._notification_pending = False
         self._failure: RuntimeError | None = None
         self._notification_error: Exception | None = None
@@ -354,6 +362,42 @@ class _ClientAudioIngress:
                 control_occupancy=self._control_occupancy,
             )
 
+    def snapshots(self) -> tuple[_QueueSnapshot, _QueueSnapshot, _QueueSnapshot]:
+        with self._lock:
+            now = self._clock()
+
+            def batch_residence(lane: _IngressLane) -> float:
+                oldest = next((batch for batch in self._batches if batch.lane is lane), None)
+                return 0.0 if oldest is None else max(0.0, (now - oldest.enqueued_at) * 1_000)
+
+            pre_roll_residence = 0.0 if not self._pre_roll else max(0.0, (now - self._pre_roll[0].retained_at) * 1_000)
+            return (
+                _QueueSnapshot(
+                    "client.ingress.data",
+                    self._config.input_queue_frames,
+                    self._occupancy_frames,
+                    self._overflow_count,
+                    batch_residence(_IngressLane.DATA),
+                    "frames",
+                ),
+                _QueueSnapshot(
+                    "client.ingress.control",
+                    self._control_capacity,
+                    self._control_occupancy,
+                    self._control_overflow_count,
+                    batch_residence(_IngressLane.CONTROL),
+                    "messages",
+                ),
+                _QueueSnapshot(
+                    "client.ingress.pre_roll",
+                    self._config.waiting_pre_roll_frames,
+                    self._pre_roll_frames,
+                    self._pre_roll_trim_count,
+                    pre_roll_residence,
+                    "frames",
+                ),
+            )
+
     @property
     def failure(self) -> RuntimeError | None:
         with self._lock:
@@ -393,7 +437,7 @@ class _ClientAudioIngress:
                     return AudioSubmitResult.OVERFLOW
                 self._validator._data = candidate
                 if annotated.activated:
-                    self._retain_locked(_AudioSpan(audio, annotated.speech))
+                    self._retain_locked(_AudioSpan(audio, annotated.speech, self._clock()))
                 return AudioSubmitResult.CLOSED_INPUT
         elif self._generation is None:
             self._generation = annotated.generation
@@ -420,10 +464,10 @@ class _ClientAudioIngress:
 
         if not annotated.speech:
             if annotated.activated:
-                self._retain_locked(_AudioSpan(audio, False))
+                self._retain_locked(_AudioSpan(audio, False, self._clock()))
             return AudioSubmitResult.IGNORED_WAITING_SILENCE
 
-        spans = (*self._pre_roll, _AudioSpan(audio, True))
+        spans = (*self._pre_roll, _AudioSpan(audio, True, self._clock()))
         reason = InputStartReason.BARGE_IN if conversation.response_id is not None else InputStartReason.SPEECH
         return self._start_later_input_locked(data, reason, annotated.generation, spans)
 
@@ -443,7 +487,7 @@ class _ClientAudioIngress:
             conversation_id,
             input_id,
             0,
-            (_AudioSpan(audio, annotated.speech),),
+            (_AudioSpan(audio, annotated.speech, self._clock()),),
         )
         self._require_aggregate_range(0, len(audio) // 2)
         messages: tuple[Message, ...] = (start_conversation, start_input, *audio_messages)
@@ -555,9 +599,10 @@ class _ClientAudioIngress:
                 self._overflow_count += 1
                 return False
         elif self._control_occupancy >= self._control_capacity:
+            self._control_overflow_count += 1
             return False
         was_empty = not self._batches
-        batch = _IngressBatch(messages, lane, audio_frames, input_id)
+        batch = _IngressBatch(messages, lane, audio_frames, input_id, self._clock())
         self._batches.append(batch)
         if lane is _IngressLane.DATA:
             self._occupancy_frames += audio_frames
@@ -598,7 +643,7 @@ class _ClientAudioIngress:
             frames = sum(len(message.audio) // 2 for message in messages if isinstance(message, InputAudioEvent))
             self._occupancy_frames -= batch.audio_frames - frames
             if messages and frames:
-                retained.append(_IngressBatch(messages, batch.lane, frames, batch.input_id))
+                retained.append(_IngressBatch(messages, batch.lane, frames, batch.input_id, batch.enqueued_at))
         self._batches = retained
 
     def _retain_locked(self, span: _AudioSpan) -> None:
@@ -608,10 +653,11 @@ class _ClientAudioIngress:
         self._pre_roll.append(span)
         self._pre_roll_frames += span.frames
         while self._pre_roll_frames > capacity:
+            self._pre_roll_trim_count += 1
             first = self._pre_roll.popleft()
             excess = self._pre_roll_frames - capacity
             if first.frames > excess:
-                trimmed = _AudioSpan(first.audio[excess * 2 :], first.speech)
+                trimmed = _AudioSpan(first.audio[excess * 2 :], first.speech, first.retained_at)
                 self._pre_roll.appendleft(trimmed)
                 self._pre_roll_frames -= excess
                 break

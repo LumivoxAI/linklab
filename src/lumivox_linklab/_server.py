@@ -51,7 +51,8 @@ from ._messages import (
 )
 from ._protocol import _Input, _Response, _TransitionResult
 from ._handshake import _serve_websocket, _perform_server_handshake
-from ._transport import _QueueLane, _QueueSnapshot, _TransportCore
+from ._transport import _QueueLane, _TransportCore
+from ._observability import _Observer, _QueueSnapshot, _lifecycle_boundary
 
 _CONTROL_CAPACITY = 16
 
@@ -497,7 +498,7 @@ class _HandlerQueue:
 
         return (
             _QueueSnapshot(
-                "server_handler.audio",
+                "server.handler.audio",
                 self._audio_capacity_frames,
                 self._audio_frames,
                 self._audio_overflows,
@@ -505,7 +506,7 @@ class _HandlerQueue:
                 "frames",
             ),
             _QueueSnapshot(
-                "server_handler.event",
+                "server.handler.event",
                 self._event_capacity,
                 self._events,
                 self._event_overflows,
@@ -530,9 +531,11 @@ class ServerSession:
         config: ServerConfig,
         input_queue_frames: int,
         event_capacity: int,
+        observer: _Observer | None = None,
     ) -> None:
         self._loop = asyncio.get_running_loop()
         self._core = core
+        self._observer = observer
         self._handler: ServerHandler | None = None
         self._events = _HandlerQueue(input_queue_frames, event_capacity, self._loop.time)
         self._handler_signals: asyncio.Queue[_HandlerSignal] = asyncio.Queue(maxsize=_CONTROL_CAPACITY)
@@ -561,8 +564,14 @@ class ServerSession:
             and ProtocolObjectKind.RESPONSE in transition.cancellation_targets
         )
         if dispatch and not self._events.put_nowait(message):
+            self._observe_handler_queues()
             self._record_handler_signal(_HandlerQueueFull(message))
             self._handle_handler_saturation(message)
+        else:
+            self._observe_handler_queues()
+        boundary = _lifecycle_boundary(message)
+        if boundary is not None:
+            self._observe_handler_queues(boundary)
         if isinstance(message, InputStartedEvent):
             self._enqueue_state(CoarseState.LISTENING)
         elif isinstance(message, InputAbortedEvent):
@@ -754,6 +763,7 @@ class ServerSession:
 
     async def _close_dispatcher(self) -> None:
         self._check_loop()
+        self._observe_handler_queues("dispatcher_close")
         self._timeouts.close()
         self._response_terminated(discard_output=True)
         self._events.close()
@@ -770,6 +780,7 @@ class ServerSession:
                 event = await self._events.get()
             except RuntimeError:
                 return
+            self._observe_handler_queues()
             try:
                 if not self._prepare_handler_event(event):
                     continue
@@ -780,10 +791,14 @@ class ServerSession:
                 return
             try:
                 await self._dispatch(event)
+                if self._observer is not None:
+                    self._observer.message(event, direction="inbound", phase="handler_dispatched")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 self._record_handler_signal(_HandlerRaised(event, error))
+                if self._observer is not None:
+                    self._observer.handler_failure(event, error)
                 try:
                     self._handle_handler_failure(event)
                 except Exception as mapping_error:
@@ -882,6 +897,10 @@ class ServerSession:
             self._handler_signals.put_nowait(signal)
         except asyncio.QueueFull:
             self._handler_signal_overflow = True
+
+    def _observe_handler_queues(self, boundary: str | None = None) -> None:
+        if self._observer is not None:
+            self._observer.queue_snapshots(self._events.snapshots(), boundary=boundary)
 
     def _handle_handler_saturation(self, message: Message) -> None:
         if not isinstance(message, InputAudioEvent):
@@ -1167,6 +1186,7 @@ class VoiceServer:
         self._sessions: set[ServerSession] = set()
         self._closed = asyncio.Event()
         self._closed.set()
+        self._connection_serial = 0
 
     async def serve(self) -> None:
         self._check_loop()
@@ -1211,6 +1231,14 @@ class VoiceServer:
             await connection.close(code=1008)
             return
         self._connections.add(connection)
+        self._connection_serial += 1
+        observer = _Observer(
+            self._logger,
+            endpoint_role=EndpointRole.SERVER.value,
+            connection_id=f"server-{self._connection_serial}",
+            clock=self._loop.time,
+        )
+        observer.lifecycle("connection_accepted", active_connections=len(self._connections))
         core: _TransportCore | None = None
         session: ServerSession | None = None
         try:
@@ -1242,12 +1270,14 @@ class VoiceServer:
                 ping_interval_s=self._config.ping_interval_s,
                 ping_timeout_s=self._config.ping_timeout_s,
                 occupancy_unit="frames",
+                observer=observer,
             )
             session = ServerSession(
                 core,
                 config=self._config,
                 input_queue_frames=self._config.input_queue_frames,
                 event_capacity=self._config.websocket_max_queue,
+                observer=observer,
             )
             self._sessions.add(session)
             handler = self._handler_factory(session)
@@ -1255,6 +1285,7 @@ class VoiceServer:
                 raise TypeError("handler_factory must return a ServerHandler")
             session._set_handler(handler)
             core.start_handshaken(handshake.client_hello, handshake.server_hello)
+            session._observe_handler_queues("ready")
             await core.wait_closed()
         except WebSocketConnectionClosed:
             pass
@@ -1263,7 +1294,8 @@ class VoiceServer:
                 with suppress(Exception):
                     await core.close(1001)
             raise
-        except Exception:
+        except Exception as error:
+            observer.failure("server_connection_failed", error)
             if core is not None:
                 with suppress(Exception):
                     await core.close(1011)

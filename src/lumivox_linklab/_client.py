@@ -44,7 +44,8 @@ from ._messages import (
 )
 from ._protocol import _TransitionResult
 from ._handshake import _open_client_websocket
-from ._transport import _QueueLane, _OutboundBatch, _QueueSnapshot, _TransportCore
+from ._transport import _QueueLane, _OutboundBatch, _TransportCore
+from ._observability import _Observer, _QueueSnapshot, _lifecycle_boundary
 from ._client_ingress import _IngressLane, _IngressBatch, _ClientAudioIngress
 
 _CONTROL_CAPACITY = 16
@@ -189,7 +190,7 @@ class _CallbackQueue:
                 oldest = next((item for item in self._items if item[1] is path), None)
                 residence = 0.0 if oldest is None else max(0.0, (now - oldest[3]) * 1_000)
                 return _QueueSnapshot(
-                    f"client_callbacks.{path.value}",
+                    f"client.callbacks.{path.value}",
                     capacity,
                     occupancy,
                     self._overflows[path],
@@ -261,6 +262,7 @@ class VoiceClient:
             config,
             notify=self._notify_handoff,
             control_capacity=_CONTROL_CAPACITY,
+            clock=self._loop.time,
         )
         self._core: _TransportCore | None = None
         self._connect_task: asyncio.Task[object] | None = None
@@ -273,6 +275,8 @@ class VoiceClient:
         self._output_format: AudioFormat | None = None
         self._transport_loss: BaseException | None = None
         self._local_failure: BaseException | None = None
+        self._connection_serial = 0
+        self._observer: _Observer | None = None
 
     @property
     def connection_state(self) -> ConnectionState:
@@ -320,16 +324,23 @@ class VoiceClient:
             self._events.discard(
                 lambda item: isinstance(item.message, OutputAudioEvent) and item.message.response_id == response_id
             )
+        self._schedule_ingress_observation()
         return result
 
     def abort_input(self, reason: InputAbortReason) -> bool:
-        return self._ingress.abort_input(reason)
+        accepted = self._ingress.abort_input(reason)
+        self._schedule_ingress_observation()
+        return accepted
 
     def cancel_conversation(self, reason: ConversationCancelReason) -> bool:
-        return self._ingress.cancel_conversation(reason)
+        accepted = self._ingress.cancel_conversation(reason)
+        self._schedule_ingress_observation()
+        return accepted
 
     def playback_finished(self, output_id: OutputId, played_frames: int) -> bool:
-        return self._ingress.playback_finished(output_id, played_frames)
+        accepted = self._ingress.playback_finished(output_id, played_frames)
+        self._schedule_ingress_observation()
+        return accepted
 
     def playback_interrupted(
         self,
@@ -338,7 +349,9 @@ class VoiceClient:
         position: PlaybackPosition,
         reason: PlaybackInterruptReason,
     ) -> bool:
-        return self._ingress.playback_interrupted(output_id, played_frames, position, reason)
+        accepted = self._ingress.playback_interrupted(output_id, played_frames, position, reason)
+        self._schedule_ingress_observation()
+        return accepted
 
     async def __aenter__(self) -> Self:
         await self.connect()
@@ -419,6 +432,7 @@ class VoiceClient:
                     except ConnectionClosed:
                         return
                     self._ingress.acknowledge(batch)
+                    self._observe_ingress_queues()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -466,6 +480,13 @@ class VoiceClient:
 
     async def _establish_connection(self) -> None:
         self._transport_loss = None
+        self._connection_serial += 1
+        self._observer = _Observer(
+            self._logger,
+            endpoint_role=EndpointRole.CLIENT.value,
+            connection_id=f"client-{self._connection_serial}",
+            clock=self._loop.time,
+        )
         self._ingress.transport_connected()
         self._queue_connection_state(ConnectionState.HANDSHAKING)
         core: _TransportCore | None = None
@@ -484,6 +505,7 @@ class VoiceClient:
                 ping_timeout_s=self._config.ping_timeout_s,
                 on_outbound_space=self._wake.set,
                 occupancy_unit="frames",
+                observer=self._observer,
             )
             self._core = core
             self._ingress.complete_handshake(handshake.client_hello, handshake.server_hello)
@@ -497,6 +519,7 @@ class VoiceClient:
             self._handoff_task = self._loop.create_task(self._run_handoff(), name="linklab-client-handoff")
             self._wake.set()
             self._queue_connection_state(ConnectionState.READY)
+            self._observe_all_queues("ready")
             if self._local_failure is not None:
                 core._request_close(1011, drain=False, loss=self._local_failure)
         except BaseException as error:
@@ -534,6 +557,7 @@ class VoiceClient:
         return False
 
     async def _finish(self) -> None:
+        self._observe_all_queues("client_finish")
         core = self._core
         if core is not None:
             await self._cleanup_connection(core)
@@ -560,6 +584,8 @@ class VoiceClient:
 
     def _record_transport_loss(self, error: BaseException) -> None:
         self._transport_loss = error
+        if self._observer is not None:
+            self._observer.failure("client_transport_lost", error)
 
     def _start_callback_dispatcher(self) -> None:
         if self._callback_task is None:
@@ -595,6 +621,7 @@ class VoiceClient:
                     await self._callback_wake.wait()
                     continue
             item, path = queued
+            self._observe_callback_queues()
             message = item.message
             if not isinstance(message, ConnectionStateEvent):
                 if item.transition is not None and not item.transition.dispatch:
@@ -603,26 +630,42 @@ class VoiceClient:
                     continue
             try:
                 await self._dispatch_callback(message)
+                if self._observer is not None and not isinstance(message, ConnectionStateEvent):
+                    self._observer.message(message, direction="inbound", phase="callback_dispatched")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
                 self._record_callback_signal(_CallbackRaised(path, message, error))
+                if self._observer is not None and not isinstance(message, ConnectionStateEvent):
+                    self._observer.callback_failure(message, error)
                 self._handle_callback_failure(path, message, error)
 
     def _queue_callback(self, message: Message, transition: _TransitionResult) -> None:
         path = self._callback_path(message)
         frames = len(message.audio) // 2 if isinstance(message, OutputAudioEvent) else 0
         if not self._events.put_nowait(_InboundEvent(message, transition), path, frames):
+            self._observe_callback_queues()
             self._record_callback_signal(_CallbackQueueSaturated(path, message))
             self._handle_callback_saturation(path, message)
+        else:
+            self._observe_callback_queues()
+        boundary = _lifecycle_boundary(message)
+        if boundary is not None:
+            self._observe_all_queues(boundary)
 
     def _queue_connection_state(self, state: ConnectionState, reason: str | None = None) -> None:
         event = ConnectionStateEvent(state, reason)
+        if self._observer is not None:
+            fields: dict[str, object] = {"state": state.value}
+            if reason is not None:
+                fields["reason_type"] = reason
+            self._observer.lifecycle("connection_state_changed", **fields)
         if not self._events.put_nowait(_InboundEvent(event), _CallbackPath.CONTROL):
             self._record_callback_signal(_CallbackQueueSaturated(_CallbackPath.CONTROL, event))
             core = self._core
             if core is not None:
                 core._request_close(1011, drain=False, loss=QueueOverflow("client callback control capacity exceeded"))
+        self._observe_callback_queues()
 
     def _handle_callback_saturation(self, path: _CallbackPath, message: Message) -> None:
         if path is _CallbackPath.OUTPUT:
@@ -739,6 +782,26 @@ class VoiceClient:
 
     def _notify_callbacks(self) -> None:
         self._loop.call_soon_threadsafe(self._callback_wake.set)
+
+    def _schedule_ingress_observation(self) -> None:
+        self._loop.call_soon_threadsafe(self._observe_ingress_queues)
+
+    def _observe_ingress_queues(self) -> None:
+        if self._observer is not None:
+            self._observer.queue_snapshots(self._ingress.snapshots())
+
+    def _observe_callback_queues(self) -> None:
+        if self._observer is not None:
+            self._observer.queue_snapshots(self._events.snapshots())
+
+    def _observe_all_queues(self, boundary: str) -> None:
+        observer = self._observer
+        if observer is None:
+            return
+        observer.queue_snapshots(self._ingress.snapshots(), boundary=boundary)
+        observer.queue_snapshots(self._events.snapshots(), boundary=boundary)
+        if self._core is not None:
+            self._core.observe_queues(boundary)
 
     def _check_loop(self) -> None:
         try:
