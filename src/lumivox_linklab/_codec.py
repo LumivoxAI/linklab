@@ -82,7 +82,7 @@ def _build_map(pairs: list[tuple[object, object]]) -> dict[str, object]:
 def _as_bytes_view(data: ReadableBuffer) -> memoryview:
     try:
         view = memoryview(data)
-    except TypeError as error:
+    except (TypeError, ValueError) as error:
         raise CodecError("message must be a readable buffer") from error
     if not view.contiguous:
         raise CodecError("message buffer must be contiguous")

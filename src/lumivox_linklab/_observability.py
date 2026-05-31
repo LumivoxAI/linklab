@@ -87,7 +87,7 @@ class _Observer:
         )
         self._clock = clock
         self._debug_counts: dict[tuple[str, str, str], int] = {}
-        self._queue_overflows: dict[str, int] = {}
+        self._queue_states: dict[str, _QueueSnapshot] = {}
         self._input_terminal_at: dict[int, float] = {}
         self._response_inputs: dict[int, int] = {}
         self._output_received_at: dict[tuple[int, int], float] = {}
@@ -111,8 +111,8 @@ class _Observer:
 
     def queue_snapshots(self, snapshots: tuple[_QueueSnapshot, ...], *, boundary: str | None = None) -> None:
         for snapshot in snapshots:
-            previous_overflows = self._queue_overflows.get(snapshot.identity, 0)
-            self._queue_overflows[snapshot.identity] = snapshot.overflow_count
+            previous = self._queue_states.get(snapshot.identity)
+            self._queue_states[snapshot.identity] = snapshot
             fields: dict[str, object] = {
                 "queue": snapshot.identity,
                 "capacity": snapshot.capacity,
@@ -125,9 +125,9 @@ class _Observer:
             if boundary is not None:
                 fields["boundary"] = boundary
                 self._logger.emit("info", "queue_snapshot", **fields)
-            elif snapshot.overflow_count > previous_overflows:
+            elif snapshot.overflow_count > (0 if previous is None else previous.overflow_count):
                 self._logger.emit("warning", "queue_overflow", **fields)
-            elif self._allow_debug("queue", snapshot.identity, "change"):
+            elif snapshot != previous:
                 self._logger.emit("debug", "queue_snapshot", **fields)
 
     def message(self, message: Message, *, direction: str, phase: str) -> None:

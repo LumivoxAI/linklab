@@ -737,7 +737,7 @@ class _ClientAudioIngress:
                 raise ValueError("wake_word must contain 1..64 UTF-8 bytes")
         try:
             view = memoryview(annotated.audio)
-        except TypeError as error:
+        except (TypeError, ValueError) as error:
             raise ValueError("audio must support the buffer protocol") from error
         if not view.contiguous:
             raise ValueError("audio must be contiguous")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Self, Protocol, runtime_checkable
+from typing import Self, Literal, Protocol, runtime_checkable
 from contextlib import suppress
 from collections import deque
 from dataclasses import dataclass
@@ -299,7 +299,7 @@ class ResponseWriter:
         self._require_open()
         return self
 
-    async def __aexit__(self, exc_type: object, _exc: object, _traceback: object) -> bool:
+    async def __aexit__(self, exc_type: object, _exc: object, _traceback: object) -> Literal[False]:
         if exc_type is None:
             await self.finish()
         elif not self._closed:
@@ -383,7 +383,7 @@ class OutputWriter:
         self._require_open()
         return self
 
-    async def __aexit__(self, exc_type: object, _exc: object, _traceback: object) -> bool:
+    async def __aexit__(self, exc_type: object, _exc: object, _traceback: object) -> Literal[False]:
         if exc_type is None:
             await self.finish()
         elif not self._closed:
@@ -413,7 +413,7 @@ class OutputWriter:
 def _copy_output_pcm(audio: ReadableBuffer) -> bytes:
     try:
         view = memoryview(audio)
-    except TypeError as error:
+    except (TypeError, ValueError) as error:
         raise TypeError("audio must support the buffer protocol") from error
     if not view.contiguous:
         raise ValueError("audio must be contiguous")
@@ -544,6 +544,7 @@ class ServerSession:
         self._server_closed_inputs: set[InputId] = set()
         self._response_writer: ResponseWriter | None = None
         self._timeouts = _LifecycleTimeouts(self, config)
+        self._close_timeout_s = config.close_timeout_s
         self._shutdown_task: asyncio.Task[None] | None = None
 
     def _set_handler(self, handler: ServerHandler) -> None:
@@ -706,8 +707,10 @@ class ServerSession:
             self._core.seal_orderly(tuple(messages))
             if closed_input_id is not None:
                 self._server_closed_inputs.add(closed_input_id)
-        await self._close_dispatcher()
-        await self._core.close(1001, drain=bool(messages))
+        await asyncio.gather(
+            self._close_dispatcher(),
+            self._core.close(1001, drain=bool(messages)),
+        )
 
     def _transport_lost(self) -> None:
         """Invalidate loop-owned application work without attempting wire delivery."""
@@ -770,8 +773,10 @@ class ServerSession:
         task = self._dispatcher_task
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
-            with suppress(asyncio.CancelledError):
-                await task
+            done, _ = await asyncio.wait((task,), timeout=self._close_timeout_s)
+            if done:
+                with suppress(asyncio.CancelledError):
+                    task.result()
         self._dispatcher_task = None
 
     async def _run_dispatcher(self) -> None:

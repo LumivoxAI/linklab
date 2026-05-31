@@ -110,7 +110,7 @@ def _require_optional_short_string(name: str, value: object) -> None:
 def _copy_pcm(name: str, value: ReadableBuffer, max_frames: int) -> bytes:
     try:
         view = memoryview(value)
-    except TypeError as error:
+    except (TypeError, ValueError) as error:
         raise TypeError(f"{name} must support the buffer protocol") from error
     if not view.contiguous:
         raise ValueError(f"{name} must be contiguous")
