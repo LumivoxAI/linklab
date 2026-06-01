@@ -262,6 +262,32 @@ def test_capture_failure_aborts_exactly_once_and_rejects_later_pcm() -> None:
     ]
 
 
+def test_abort_input_rejections_do_not_mutate_lifecycle_state() -> None:
+    disconnected = _ClientAudioIngress(linklab.ClientConfig("ws://localhost:8765", (PCM_16K,)))
+    assert disconnected.abort_input(linklab.InputAbortReason.CAPTURE_FAILED) is False
+
+    ingress = make_ingress(control_capacity=1)
+    assert ingress.abort_input(linklab.InputAbortReason.CAPTURE_FAILED) is False
+    assert ingress.submit(annotated(1, activated=True)) is linklab.AudioSubmitResult.ACCEPTED
+    assert ingress.abort_input(linklab.InputAbortReason.CAPTURE_FAILED) is True
+    terminal = ingress.state
+    terminal_data = ingress._validator._data
+    assert ingress.abort_input(linklab.InputAbortReason.DISCONTINUITY) is False
+    assert ingress.state == terminal
+    assert ingress._validator._data == terminal_data
+
+    saturated = make_ingress(control_capacity=1)
+    assert saturated.submit(annotated(1, activated=True)) is linklab.AudioSubmitResult.ACCEPTED
+    before_rejection = saturated._validator._data
+    with saturated._lock:
+        saturated._control_occupancy = 1
+    assert saturated.abort_input(linklab.InputAbortReason.CAPTURE_FAILED) is False
+    assert saturated._validator._data == before_rejection
+    assert not any(
+        isinstance(message, linklab.InputAbortedEvent) for batch in take_all(saturated) for message in batch.messages
+    )
+
+
 def test_conversation_cancel_is_thread_safe_and_enqueued_once() -> None:
     ingress = make_ingress()
     assert ingress.submit(annotated(10, activated=True)) is linklab.AudioSubmitResult.ACCEPTED
@@ -419,6 +445,34 @@ def test_generation_change_without_discontinuity_is_still_a_boundary() -> None:
             linklab.InputAbortReason.DISCONTINUITY,
         ),
     )
+
+
+def test_waiting_generation_boundary_discards_old_pre_roll_before_next_input() -> None:
+    ingress = make_ingress(pre_roll=20)
+    assert ingress.submit(annotated(1, generation=1, activated=True)) is linklab.AudioSubmitResult.ACCEPTED
+    take_all(ingress)
+    finish_input_and_response(ingress, linklab.InputId(1), 1)
+
+    assert (
+        ingress.submit(annotated(3, generation=1, activated=True, value=3))
+        is linklab.AudioSubmitResult.IGNORED_WAITING_SILENCE
+    )
+    assert (
+        ingress.submit(annotated(4, generation=2, discontinuity=True, activated=True, value=4))
+        is linklab.AudioSubmitResult.IGNORED_WAITING_SILENCE
+    )
+    assert (
+        ingress.submit(annotated(2, generation=2, activated=True, speech=True, value=5))
+        is linklab.AudioSubmitResult.ACCEPTED
+    )
+
+    batch = ingress.next_batch()
+    assert batch is not None
+    events = audio_messages(batch)
+    assert [(event.start_frame, event.speech, event.audio) for event in events] == [
+        (0, False, pcm(4, 4)),
+        (4, True, pcm(2, 5)),
+    ]
 
 
 def test_barge_in_starts_immediately_before_server_acknowledgement() -> None:

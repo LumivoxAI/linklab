@@ -310,6 +310,154 @@ def test_client_accepts_connection_error_in_place_of_server_hello() -> None:
     run(scenario())
 
 
+def test_client_sends_only_hello_while_server_reply_is_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
+    class BlockedConnection:
+        subprotocol = _SUBPROTOCOL
+        state = State.OPEN
+
+        def __init__(self) -> None:
+            self.sent: list[bytes] = []
+            self.recv_started = asyncio.Event()
+            self.close_codes: list[int] = []
+
+        async def send(self, data: bytes) -> None:
+            self.sent.append(data)
+
+        async def recv(self) -> bytes:
+            self.recv_started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        async def close(self, code: int = 1000) -> None:
+            self.close_codes.append(code)
+            self.state = State.CLOSED
+
+    async def scenario() -> None:
+        connection = BlockedConnection()
+
+        async def fake_connect(_uri: str, **_kwargs: Any) -> Any:
+            return connection
+
+        monkeypatch.setattr("lumivox_linklab._handshake.connect", fake_connect)
+        opening = asyncio.create_task(_open_client_websocket(client_config(1)))
+        await connection.recv_started.wait()
+        await asyncio.sleep(0)
+
+        assert len(connection.sent) == 1
+        assert isinstance(
+            linklab.decode_message(
+                connection.sent[0],
+                direction=linklab.MessageDirection.CLIENT_TO_SERVER,
+                limits=linklab.ConnectionLimits(),
+            ),
+            linklab.ClientHello,
+        )
+
+        opening.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+        assert connection.close_codes == [1000]
+
+    run(scenario())
+
+
+def test_client_rejects_oversized_first_reply_before_msgpack_decode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class OversizedReplyConnection:
+        subprotocol = _SUBPROTOCOL
+        state = State.OPEN
+
+        def __init__(self) -> None:
+            self.close_codes: list[int] = []
+
+        async def send(self, _data: bytes) -> None:
+            pass
+
+        async def recv(self) -> bytes:
+            return b"x" * 16_385
+
+        async def close(self, code: int = 1000) -> None:
+            self.close_codes.append(code)
+            self.state = State.CLOSED
+
+    async def scenario() -> None:
+        connection = OversizedReplyConnection()
+
+        async def fake_connect(_uri: str, **_kwargs: Any) -> Any:
+            return connection
+
+        def forbidden_unpack(*_args: Any, **_kwargs: Any) -> Any:
+            raise AssertionError("oversized first reply reached MessagePack")
+
+        monkeypatch.setattr("lumivox_linklab._handshake.connect", fake_connect)
+        monkeypatch.setattr("lumivox_linklab._codec.msgpack.unpackb", forbidden_unpack)
+        with pytest.raises(_InvalidHello) as raised:
+            await _open_client_websocket(client_config(1))
+        assert raised.value.code is linklab.ErrorCode.MESSAGE_TOO_LARGE
+        assert connection.close_codes == [1002]
+
+    run(scenario())
+
+
+def test_sorted_unknown_capabilities_are_ignored_by_both_peers() -> None:
+    async def scenario() -> None:
+        config = server_config()
+        server_capabilities = (*CAPABILITIES, "vendor_server")
+
+        async def handler(connection: ServerConnection) -> None:
+            frame = await connection.recv()
+            assert type(frame) is bytes
+            client_hello = _decode_first_message(frame, linklab.MessageDirection.CLIENT_TO_SERVER)
+            assert isinstance(client_hello, linklab.ClientHello)
+            await connection.send(
+                linklab.encode_message(
+                    linklab.ServerHello(
+                        1,
+                        server_capabilities,
+                        PCM_16K,
+                        linklab.ConnectionLimits(max_output_audio_frames=1_600),
+                    )
+                )
+            )
+            await connection.wait_closed()
+
+        server = await _serve_websocket(config, handler)
+        try:
+            handshake = await _open_client_websocket(client_config(config.port, output_formats=(PCM_16K,)))
+            assert handshake.server_hello.capabilities == server_capabilities
+            await handshake.connection.close()
+        finally:
+            await close_server(server)
+
+        client_value = primitive_client_hello()
+        client_value["capabilities"] = [*CAPABILITIES, "vendor_client"]
+        payload = cast(bytes, msgpack.packb(client_value, use_bin_type=True))
+
+        accepted: list[linklab.ClientHello] = []
+
+        async def accepting(connection: ServerConnection) -> None:
+            result = await _perform_server_handshake(connection, config)
+            assert result is not None
+            accepted.append(result.client_hello)
+
+        server = await _serve_websocket(config, accepting)
+        try:
+            async with connect(
+                f"ws://127.0.0.1:{config.port}",
+                subprotocols=[_SUBPROTOCOL],
+                compression=None,
+                proxy=None,
+            ) as connection:
+                await connection.send(payload)
+                assert type(await connection.recv()) is bytes
+        finally:
+            await close_server(server)
+        assert accepted[0].capabilities == (*CAPABILITIES, "vendor_client")
+
+    run(scenario())
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [

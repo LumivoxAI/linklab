@@ -403,6 +403,40 @@ def test_loopback_facade_handoffs_capture_thread_control_and_closes_idempotently
     run(scenario())
 
 
+def test_connect_is_one_shot_concurrent_safe_and_does_not_mutate_on_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        connection = FakeConnection()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            entered.set()
+            await release.wait()
+            return fake_handshake(connection)
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), NullCallbacks(), object())
+        connecting = asyncio.create_task(client.connect())
+        await entered.wait()
+        before = (client.connection_state, client.output_format, client._core)
+
+        with pytest.raises(RuntimeError, match="only be called once"):
+            await client.connect()
+        assert (client.connection_state, client.output_format, client._core) == before
+
+        release.set()
+        await connecting
+        ready = (client.connection_state, client.output_format, client._core)
+        with pytest.raises(RuntimeError, match="only be called once"):
+            await client.connect()
+        assert (client.connection_state, client.output_format, client._core) == ready
+        await client.close()
+
+    run(scenario())
+
+
 def test_context_manager_propagates_body_exception() -> None:
     async def scenario() -> None:
         port = unused_port()
@@ -674,6 +708,46 @@ def test_callback_failure_without_conversation_closes_1011(monkeypatch: pytest.M
         assert isinstance(signal, _CallbackRaised)
         assert connection.close_codes == [1011]
         assert_disconnected(client)
+
+    run(scenario())
+
+
+def test_blocked_connection_callback_queue_saturation_closes_1011(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockingConnectionCallbacks(NullCallbacks):
+        def __init__(self) -> None:
+            self.entered = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def on_connection_state(self, _event: linklab.ConnectionStateEvent) -> None:
+            self.entered.set()
+            await self.release.wait()
+
+    async def scenario() -> None:
+        connection = FakeConnection()
+        callbacks = BlockingConnectionCallbacks()
+
+        async def open_fake(_config: linklab.ClientConfig) -> _ClientHandshake:
+            return fake_handshake(connection)
+
+        monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        await client.connect()
+        await callbacks.entered.wait()
+        assert client._ingress.state.conversation_id is None
+
+        for _ in range(16):
+            client._queue_connection_state(linklab.ConnectionState.READY)
+        await client._core.wait_closed()  # type: ignore[union-attr]
+
+        signal = client._callback_signals.get_nowait()
+        assert isinstance(signal, _CallbackQueueSaturated)
+        assert signal.path is _CallbackPath.CONTROL
+        assert isinstance(signal.event, linklab.ConnectionStateEvent)
+        assert connection.close_codes == [1011]
+        callbacks.release.set()
+        await client.wait_closed()
 
     run(scenario())
 

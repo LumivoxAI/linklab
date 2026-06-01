@@ -484,6 +484,18 @@ def test_output_context_manager_normal_and_exceptional_exit() -> None:
     run(exceptional())
 
 
+def test_empty_normal_output_context_propagates_protocol_violation() -> None:
+    async def scenario() -> None:
+        server, client, session, _conversation_id, input_id = await open_ready_session()
+        response = await session.start_response(input_id)
+        with pytest.raises(linklab.ProtocolViolation, match="at least one audio frame"):
+            async with await response.start_output():
+                pass
+        await close_pair(server, client)
+
+    run(scenario())
+
+
 def test_output_writer_is_invalidated_by_manual_cancel_and_external_termination() -> None:
     async def manual_cancel() -> None:
         server, client, session, _, input_id = await open_ready_session()

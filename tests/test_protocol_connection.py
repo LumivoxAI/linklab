@@ -1,5 +1,6 @@
-from typing import Callable
-from dataclasses import FrozenInstanceError
+import typing
+from typing import Any, Callable
+from dataclasses import FrozenInstanceError, fields
 
 import pytest
 
@@ -264,6 +265,93 @@ def test_allocator_emits_uint32_max_then_fails_without_mutation_or_wrap() -> Non
     with pytest.raises(linklab.ProtocolViolation, match="id_exhausted"):
         exhausted.allocate()
     assert exhausted.next_value == 4_294_967_296
+
+
+def test_all_four_allocators_are_independent_sequential_and_exhaustion_is_local_fatal() -> None:
+    validator = ready_validator(linklab.EndpointRole.CLIENT)
+    conversation_id = linklab.ConversationId(1)
+    input_id = linklab.InputId(1)
+    response_id = linklab.ResponseId(1)
+    output_id = linklab.OutputId(1)
+    validator.accept(linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+    validator.accept(linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0))
+    validator.accept(linklab.InputClosedEvent(conversation_id, input_id, 0, linklab.InputCloseReason.NO_SPEECH))
+    validator.accept(linklab.TranscriptFinalEvent(conversation_id, input_id, ""))
+    validator.accept(linklab.ResponseStartedEvent(conversation_id, response_id, input_id, False))
+    validator.accept(linklab.OutputStartedEvent(conversation_id, response_id, output_id))
+
+    allocators = (
+        validator._data.conversation_ids,
+        validator._data.input_ids,
+        validator._data.response_ids,
+        validator._data.output_ids,
+    )
+    assert tuple(allocator.next_value for allocator in allocators) == (2, 2, 2, 2)
+    assert tuple(allocator.allocate()[0] for allocator in allocators) == (2, 2, 2, 2)
+    assert tuple(allocator.next_value for allocator in allocators) == (2, 2, 2, 2)
+
+    exhausted_allocators = tuple(_IdAllocator(4_294_967_296) for _ in allocators)
+    for exhausted in exhausted_allocators:
+        with pytest.raises(linklab.ProtocolViolation, match="id_exhausted"):
+            exhausted.allocate()
+    assert tuple(allocator.next_value for allocator in exhausted_allocators) == (4_294_967_296,) * 4
+
+
+def test_every_post_handshake_message_schema_carries_explicit_scope_ids() -> None:
+    expected_ids: dict[type[Any], tuple[str, ...]] = {
+        linklab.ConversationStartedEvent: ("conversation_id",),
+        linklab.InputStartedEvent: ("conversation_id", "input_id"),
+        linklab.InputAudioEvent: ("conversation_id", "input_id"),
+        linklab.InputAbortedEvent: ("conversation_id", "input_id"),
+        linklab.PlaybackFinishedEvent: ("conversation_id", "response_id", "output_id"),
+        linklab.PlaybackInterruptedEvent: ("conversation_id", "response_id", "output_id"),
+        linklab.ConversationCancelledEvent: ("conversation_id",),
+        linklab.StateEvent: ("conversation_id",),
+        linklab.InputClosedEvent: ("conversation_id", "input_id"),
+        linklab.TranscriptUpdateEvent: ("conversation_id", "input_id"),
+        linklab.TranscriptFinalEvent: ("conversation_id", "input_id"),
+        linklab.ResponseStartedEvent: ("conversation_id", "response_id", "input_id"),
+        linklab.ResponseTextDeltaEvent: ("conversation_id", "response_id"),
+        linklab.ResponseTextFinalEvent: ("conversation_id", "response_id"),
+        linklab.OutputStartedEvent: ("conversation_id", "response_id", "output_id"),
+        linklab.OutputAudioEvent: ("conversation_id", "response_id", "output_id"),
+        linklab.OutputEndedEvent: ("conversation_id", "response_id", "output_id"),
+        linklab.ResponseEndedEvent: ("conversation_id", "response_id"),
+        linklab.ResponseCancelledEvent: ("conversation_id", "response_id"),
+        linklab.ConversationEndedEvent: ("conversation_id",),
+    }
+    id_types = {
+        "conversation_id": linklab.ConversationId,
+        "input_id": linklab.InputId,
+        "response_id": linklab.ResponseId,
+        "output_id": linklab.OutputId,
+    }
+    for message_type, names in expected_ids.items():
+        assert names == tuple(field.name for field in fields(message_type) if field.name in id_types)
+        hints = typing.get_type_hints(message_type)
+        assert all(hints[name] is id_types[name] for name in names)
+
+    error_hints = typing.get_type_hints(linklab.ErrorEvent)
+    error_id_types = {name: id_type for name, id_type in id_types.items() if name != "output_id"}
+    assert all(error_hints[name] == id_type | None for name, id_type in error_id_types.items())
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        linklab.ConversationStartedEvent(linklab.ConversationId(2), "wake_word"),
+        linklab.StateEvent(linklab.ConversationId(1), 1, linklab.CoarseState.WAITING),
+    ],
+)
+def test_conversation_messages_after_begin_close_are_rejected_atomically(message: linklab.Message) -> None:
+    validator = ready_validator(linklab.EndpointRole.CLIENT)
+    if not isinstance(message, linklab.ConversationStartedEvent):
+        validator.accept(linklab.ConversationStartedEvent(linklab.ConversationId(1), "wake_word"))
+    validator.begin_close()
+    before = validator._data
+    with pytest.raises(linklab.ProtocolViolation, match="active connection"):
+        validator.accept(message)
+    assert validator._data == before
 
 
 def test_constructor_requires_endpoint_role() -> None:

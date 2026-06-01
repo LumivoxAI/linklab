@@ -1,7 +1,9 @@
 import ssl
+import time
 import socket
 import asyncio
-from typing import Any, cast
+import inspect
+from typing import Any, Self, cast, get_type_hints
 from collections.abc import Coroutine
 
 import pytest
@@ -267,6 +269,80 @@ def test_serve_is_one_shot_and_context_manager_does_not_suppress() -> None:
 
     run(concurrent_serve())
     run(context_manager())
+
+
+def test_voice_server_exact_async_surface_and_annotations() -> None:
+    assert {name for name in vars(linklab.VoiceServer) if not name.startswith("_")} == {
+        "serve",
+        "close",
+        "wait_closed",
+    }
+    assert inspect.signature(linklab.VoiceServer, eval_str=True) == inspect.Signature(
+        parameters=(
+            inspect.Parameter("config", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=linklab.ServerConfig),
+            inspect.Parameter(
+                "handler_factory",
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                annotation=get_type_hints(linklab.VoiceServer.__init__)["handler_factory"],
+            ),
+            inspect.Parameter("logger", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=object),
+        ),
+        return_annotation=None,
+    )
+    for name in ("serve", "close", "wait_closed"):
+        method = getattr(linklab.VoiceServer, name)
+        assert inspect.iscoroutinefunction(method)
+        assert get_type_hints(method)["return"] is type(None)
+    assert get_type_hints(linklab.VoiceServer.__aenter__)["return"] is Self
+    assert get_type_hints(linklab.VoiceServer.__aexit__)["return"] is bool
+
+
+def test_server_close_is_bounded_when_handler_suppresses_cancellation() -> None:
+    class StubbornHandler(RecordingHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.release = asyncio.Event()
+            self.finished = asyncio.Event()
+
+        async def on_conversation_started(
+            self,
+            _session: linklab.ServerSession,
+            event: linklab.ConversationStartedEvent,
+        ) -> None:
+            self.events.append(event)
+            self.entered.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                self.cancelled.set()
+                await self.release.wait()
+            finally:
+                self.finished.set()
+
+    async def scenario() -> None:
+        config = server_config(close_timeout_s=0.01)
+        handler = StubbornHandler()
+        server = linklab.VoiceServer(config, lambda _session: handler, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        await send_message(
+            client.connection,
+            linklab.ConversationStartedEvent(linklab.ConversationId(1), "wake_word"),
+        )
+        await handler.entered.wait()
+
+        started = time.monotonic()
+        await asyncio.wait_for(server.close(), 0.2)
+        assert time.monotonic() - started < 0.2
+        assert handler.cancelled.is_set()
+
+        handler.release.set()
+        await handler.finished.wait()
+        await client.connection.wait_closed()
+
+    run(scenario())
 
 
 def test_close_before_serve_is_idempotent_and_ssl_context_is_caller_owned() -> None:

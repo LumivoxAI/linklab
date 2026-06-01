@@ -1,5 +1,6 @@
 import ssl
 from enum import StrEnum
+from typing import get_type_hints
 from dataclasses import FrozenInstanceError, fields, replace
 
 import pytest
@@ -314,7 +315,10 @@ def test_config_accepts_ssl_context() -> None:
 
 def test_server_defaults() -> None:
     config = linklab.ServerConfig(9000, (PCM_16K,))
+    assert config.port == 9000
+    assert config.output_formats == (PCM_16K,)
     assert config.host == "127.0.0.1"
+    assert config.ssl_context is None
     assert config.limits == linklab.ConnectionLimits()
     assert config.max_connections == 8
     assert config.input_queue_frames == 32_000
@@ -322,6 +326,13 @@ def test_server_defaults() -> None:
     assert config.waiting_timeout_s == 60.0
     assert config.input_timeout_s == 120.0
     assert config.processing_timeout_s == 120.0
+    assert config.handshake_timeout_s == 5.0
+    assert config.close_timeout_s == 10.0
+    assert config.ping_interval_s == 20.0
+    assert config.ping_timeout_s == 20.0
+    assert config.websocket_max_queue == 16
+    assert config.websocket_write_limit == 65_536
+    assert config.agent == "lumivox-linklab"
 
 
 def test_server_accepts_any_unique_supported_format_order() -> None:
@@ -401,3 +412,198 @@ def test_server_output_cap_uses_each_selected_rate_minimum(rate: int, minimum: i
     assert linklab.ServerConfig(9000, formats, limits=linklab.ConnectionLimits(max_output_audio_frames=minimum))
     with pytest.raises(ValueError):
         linklab.ServerConfig(9000, formats, limits=linklab.ConnectionLimits(max_output_audio_frames=minimum - 1))
+
+
+def test_every_client_config_field_accepts_exact_bounds_and_rejects_adjacent_wrong_types_nan_inf() -> None:
+    accepted: object
+    invalid: object
+    name: str
+    maximum: int | float
+    assert tuple(field.name for field in fields(linklab.ClientConfig)) == (
+        "uri",
+        "output_formats",
+        "ssl_context",
+        "input_queue_frames",
+        "playback_queue_ms",
+        "waiting_pre_roll_frames",
+        "connect_timeout_s",
+        "handshake_timeout_s",
+        "close_timeout_s",
+        "ping_interval_s",
+        "ping_timeout_s",
+        "websocket_max_queue",
+        "websocket_write_limit",
+        "reconnect",
+        "reconnect_initial_s",
+        "reconnect_max_s",
+        "agent",
+    )
+    assert get_type_hints(linklab.ClientConfig) == {
+        "uri": str,
+        "output_formats": tuple[linklab.AudioFormat, ...],
+        "ssl_context": ssl.SSLContext | None,
+        "input_queue_frames": int,
+        "playback_queue_ms": int,
+        "waiting_pre_roll_frames": int,
+        "connect_timeout_s": float,
+        "handshake_timeout_s": float,
+        "close_timeout_s": float,
+        "ping_interval_s": float,
+        "ping_timeout_s": float,
+        "websocket_max_queue": int,
+        "websocket_write_limit": int,
+        "reconnect": bool,
+        "reconnect_initial_s": float,
+        "reconnect_max_s": float,
+        "agent": str,
+    }
+    assert _client(uri="").uri == ""
+    assert _client(output_formats=(PCM_16K,)).output_formats == (PCM_16K,)
+    assert _client(ssl_context=None).ssl_context is None
+    for name in ("input_queue_frames", "playback_queue_ms"):
+        assert getattr(_client(**{name: 1}), name) == 1
+        with pytest.raises(ValueError):
+            _client(**{name: 0})
+        with pytest.raises(TypeError):
+            _client(**{name: True})
+    assert _client(waiting_pre_roll_frames=0).waiting_pre_roll_frames == 0
+    with pytest.raises(ValueError):
+        _client(waiting_pre_roll_frames=-1)
+    with pytest.raises(TypeError):
+        _client(waiting_pre_roll_frames=True)
+
+    bounded_floats = {
+        "connect_timeout_s": 10.0,
+        "handshake_timeout_s": 5.0,
+        "close_timeout_s": 10.0,
+        "ping_interval_s": 20.0,
+        "ping_timeout_s": 20.0,
+    }
+    for name, maximum in bounded_floats.items():
+        assert getattr(_client(**{name: maximum}), name) == maximum
+        assert getattr(_client(**{name: 0.001}), name) == 0.001
+        for invalid in (0, maximum + 0.001, float("nan"), float("inf"), True, "1"):
+            with pytest.raises((TypeError, ValueError)):
+                _client(**{name: invalid})
+    for name, maximum in (("websocket_max_queue", 16), ("websocket_write_limit", 65_536)):
+        for accepted in (1, maximum):
+            assert getattr(_client(**{name: accepted}), name) == accepted
+        for invalid in (0, maximum + 1, True, 1.0):
+            with pytest.raises((TypeError, ValueError)):
+                _client(**{name: invalid})
+    for accepted in (False, True):
+        assert _client(reconnect=accepted).reconnect is accepted
+    for invalid in (0, 1, None):
+        with pytest.raises(TypeError):
+            _client(reconnect=invalid)
+    for name in ("reconnect_initial_s", "reconnect_max_s"):
+        changes = {name: 0.001}
+        if name == "reconnect_max_s":
+            changes["reconnect_initial_s"] = 0.001
+        assert getattr(_client(**changes), name) == 0.001
+        for invalid in (0, -1, float("nan"), float("inf"), True, "1"):
+            with pytest.raises((TypeError, ValueError)):
+                _client(**{name: invalid})
+    assert _client(reconnect_initial_s=1.0, reconnect_max_s=1.0)
+    with pytest.raises(ValueError):
+        _client(reconnect_initial_s=1.001, reconnect_max_s=1.0)
+    for accepted in ("x", "é" * 32):
+        assert _client(agent=accepted).agent == accepted
+    for invalid in ("", "é" * 32 + "x", 1):
+        with pytest.raises((TypeError, ValueError)):
+            _client(agent=invalid)
+
+
+def test_every_server_config_field_accepts_exact_bounds_and_rejects_adjacent_wrong_types_nan_inf() -> None:
+    accepted: object
+    invalid: object
+    name: str
+    maximum: int | float
+    assert tuple(field.name for field in fields(linklab.ServerConfig)) == (
+        "port",
+        "output_formats",
+        "host",
+        "ssl_context",
+        "limits",
+        "max_connections",
+        "input_queue_frames",
+        "output_queue_ms",
+        "waiting_timeout_s",
+        "input_timeout_s",
+        "processing_timeout_s",
+        "handshake_timeout_s",
+        "close_timeout_s",
+        "ping_interval_s",
+        "ping_timeout_s",
+        "websocket_max_queue",
+        "websocket_write_limit",
+        "agent",
+    )
+    assert get_type_hints(linklab.ServerConfig) == {
+        "port": int,
+        "output_formats": tuple[linklab.AudioFormat, ...],
+        "host": str,
+        "ssl_context": ssl.SSLContext | None,
+        "limits": linklab.ConnectionLimits,
+        "max_connections": int,
+        "input_queue_frames": int,
+        "output_queue_ms": int,
+        "waiting_timeout_s": float,
+        "input_timeout_s": float,
+        "processing_timeout_s": float,
+        "handshake_timeout_s": float,
+        "close_timeout_s": float,
+        "ping_interval_s": float,
+        "ping_timeout_s": float,
+        "websocket_max_queue": int,
+        "websocket_write_limit": int,
+        "agent": str,
+    }
+    for accepted in (1, 65_535):
+        assert _server(port=accepted).port == accepted
+    for invalid in (0, 65_536, True, 1.0):
+        with pytest.raises((TypeError, ValueError)):
+            _server(port=invalid)
+    assert _server(output_formats=(PCM_16K,)).output_formats == (PCM_16K,)
+    assert _server(host="").host == ""
+    with pytest.raises(TypeError):
+        _server(host=1)
+    assert _server(ssl_context=None).ssl_context is None
+    assert _server(limits=linklab.ConnectionLimits()).limits == linklab.ConnectionLimits()
+    with pytest.raises(TypeError):
+        _server(limits=object())
+
+    for name in ("max_connections", "input_queue_frames", "output_queue_ms"):
+        assert getattr(_server(**{name: 1}), name) == 1
+        for invalid in (0, True, 1.0):
+            with pytest.raises((TypeError, ValueError)):
+                _server(**{name: invalid})
+    unbounded_floats = ("waiting_timeout_s", "input_timeout_s", "processing_timeout_s")
+    bounded_floats = {
+        "handshake_timeout_s": 5.0,
+        "close_timeout_s": 10.0,
+        "ping_interval_s": 20.0,
+        "ping_timeout_s": 20.0,
+    }
+    for name in unbounded_floats:
+        assert getattr(_server(**{name: 0.001}), name) == 0.001
+        for invalid in (0, -1, float("nan"), float("inf"), True, "1"):
+            with pytest.raises((TypeError, ValueError)):
+                _server(**{name: invalid})
+    for name, maximum in bounded_floats.items():
+        for accepted in (0.001, maximum):
+            assert getattr(_server(**{name: accepted}), name) == accepted
+        for invalid in (0, maximum + 0.001, float("nan"), float("inf"), True, "1"):
+            with pytest.raises((TypeError, ValueError)):
+                _server(**{name: invalid})
+    for name, maximum in (("websocket_max_queue", 16), ("websocket_write_limit", 65_536)):
+        for accepted in (1, maximum):
+            assert getattr(_server(**{name: accepted}), name) == accepted
+        for invalid in (0, maximum + 1, True, 1.0):
+            with pytest.raises((TypeError, ValueError)):
+                _server(**{name: invalid})
+    for accepted in ("x", "é" * 32):
+        assert _server(agent=accepted).agent == accepted
+    for invalid in ("", "é" * 32 + "x", 1):
+        with pytest.raises((TypeError, ValueError)):
+            _server(agent=invalid)
