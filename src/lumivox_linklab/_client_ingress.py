@@ -35,8 +35,12 @@ from ._messages import (
     InputAudioEvent,
     InputClosedEvent,
     OutputAudioEvent,
+    OutputEndedEvent,
     InputAbortedEvent,
     InputStartedEvent,
+    OutputStartedEvent,
+    ResponseEndedEvent,
+    ResponseStartedEvent,
     PlaybackFinishedEvent,
     ConversationEndedEvent,
     ResponseCancelledEvent,
@@ -330,7 +334,18 @@ class _ClientAudioIngress:
     def is_current(self, message: Message) -> bool:
         """Return whether queued response content is still publishable."""
         with self._lock:
-            if isinstance(message, (ResponseTextDeltaEvent, ResponseTextFinalEvent, OutputAudioEvent)):
+            if isinstance(
+                message,
+                (
+                    ResponseStartedEvent,
+                    ResponseTextDeltaEvent,
+                    ResponseTextFinalEvent,
+                    OutputStartedEvent,
+                    OutputAudioEvent,
+                    OutputEndedEvent,
+                    ResponseEndedEvent,
+                ),
+            ):
                 response = self._validator._find_response(self._validator._data, message.response_id)
                 return response is not None and not response.stale
             return True

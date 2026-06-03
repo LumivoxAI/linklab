@@ -322,7 +322,8 @@ class VoiceClient:
         result = self._ingress.submit(audio)
         if result is AudioSubmitResult.ACCEPTED and response_id is not None:
             self._events.discard(
-                lambda item: isinstance(item.message, OutputAudioEvent) and item.message.response_id == response_id
+                lambda item: not isinstance(item.message, ConnectionStateEvent)
+                and not self._ingress.is_current(item.message)
             )
         self._schedule_ingress_observation()
         return result
