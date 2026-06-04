@@ -945,6 +945,62 @@ def test_endpoint_late_pcm_and_identical_terminal_events_are_not_dispatched() ->
     run(scenario())
 
 
+@pytest.mark.parametrize("late_start", [2, 3])
+def test_endpoint_close_race_validates_late_pcm_before_discard(late_start: int) -> None:
+    class BlockingHandler(RecordingHandler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.audio_entered = asyncio.Event()
+            self.release_audio = asyncio.Event()
+
+        async def on_input_audio(self, _session: linklab.ServerSession, event: linklab.InputAudioEvent) -> None:
+            self.events.append(event)
+            self.audio_entered.set()
+            await self.release_audio.wait()
+
+    async def scenario() -> None:
+        config = server_config()
+        sessions: list[linklab.ServerSession] = []
+        handler = BlockingHandler()
+
+        def factory(session: linklab.ServerSession) -> BlockingHandler:
+            sessions.append(session)
+            return handler
+
+        server = linklab.VoiceServer(config, factory, object())
+        await server.serve()
+        client = await _open_client_websocket(client_config(config.port))
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+        await send_message(client.connection, linklab.ConversationStartedEvent(conversation_id, "wake_word"))
+        await send_message(
+            client.connection,
+            linklab.InputStartedEvent(conversation_id, input_id, linklab.InputStartReason.ACTIVATION, 0),
+        )
+        await send_message(client.connection, linklab.InputAudioEvent(conversation_id, input_id, 0, True, b"\0" * 4))
+        await handler.audio_entered.wait()
+
+        await sessions[0].close_input(input_id, linklab.InputCloseReason.ENDPOINT)
+        await send_message(
+            client.connection,
+            linklab.InputAudioEvent(conversation_id, input_id, late_start, False, b"\0" * 2),
+        )
+        if late_start == 2:
+            await asyncio.sleep(0)
+            assert client.connection.close_code is None
+        else:
+            await client.connection.wait_closed()
+            assert client.connection.close_code == 1002
+
+        handler.release_audio.set()
+        await asyncio.sleep(0)
+        assert [event.start_frame for event in handler.events if isinstance(event, linklab.InputAudioEvent)] == [0]
+        await client.connection.close()
+        await server.close()
+
+    run(scenario())
+
+
 def test_server_session_rejects_use_from_another_event_loop() -> None:
     retained: list[linklab.ServerSession] = []
 

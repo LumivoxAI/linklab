@@ -406,3 +406,36 @@ def test_peer_cancel_with_active_output_orders_child_before_conversation_end() -
         await harness.close()
 
     run(scenario())
+
+
+@pytest.mark.parametrize("failure_first", [False, True])
+def test_generation_failure_and_conversation_cancel_have_one_winning_response_terminal(
+    failure_first: bool,
+) -> None:
+    async def scenario() -> None:
+        harness = await open_harness()
+        response = await harness.session.start_response(linklab.InputId(1))
+        await wait_for_event(harness.callbacks.events, linklab.ResponseStartedEvent)
+
+        if failure_first:
+            await response.cancel(linklab.ResponseCancelReason.GENERATION_FAILED)
+            await wait_for_event(harness.callbacks.events, linklab.ResponseCancelledEvent)
+            assert harness.client.cancel_conversation(linklab.ConversationCancelReason.USER)
+        else:
+            assert harness.client.cancel_conversation(linklab.ConversationCancelReason.USER)
+            await wait_for_event(harness.callbacks.events, linklab.ResponseCancelledEvent)
+            with pytest.raises(linklab.WriterClosed):
+                await response.cancel(linklab.ResponseCancelReason.GENERATION_FAILED)
+
+        await wait_for_event(harness.callbacks.events, linklab.ConversationEndedEvent)
+        terminals = [event for event in harness.callbacks.events if isinstance(event, linklab.ResponseCancelledEvent)]
+        assert len(terminals) == 1
+        expected = (
+            linklab.ResponseCancelReason.GENERATION_FAILED
+            if failure_first
+            else linklab.ResponseCancelReason.CONVERSATION_CANCELLED
+        )
+        assert terminals[0].reason is expected
+        await harness.close()
+
+    run(scenario())

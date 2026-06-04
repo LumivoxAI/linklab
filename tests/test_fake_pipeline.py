@@ -505,3 +505,33 @@ def test_fake_pipeline_user_cancel_orders_terminals_and_accepts_late_accounting(
             await harness.close()
 
     run(scenario())
+
+
+def test_fake_pipeline_simultaneous_client_and_server_close_leaves_no_live_work() -> None:
+    async def scenario() -> None:
+        output_gate = asyncio.Event()
+        plan = TurnPlan(1, "closing", output_chunks=(pcm(0x70, 2), pcm(0x71, 1)), output_gate=output_gate)
+        harness = await open_harness([plan])
+        try:
+            assert harness.wakelab.submit(pcm(0x30, 1), speech=True, activated=True) is (
+                linklab.AudioSubmitResult.ACCEPTED
+            )
+            await harness.callbacks.journal.wait_for(linklab.OutputAudioEvent)
+
+            await asyncio.gather(harness.client.close(), harness.server.close())
+            output_gate.set()
+            await asyncio.wait_for(plan.done.wait(), 1)
+
+            assert harness.client.connection_state is linklab.ConnectionState.DISCONNECTED
+            assert plan.writer_closed
+            live_names = {
+                task.get_name()
+                for task in asyncio.all_tasks()
+                if task is not asyncio.current_task() and not task.done()
+            }
+            assert not {name for name in live_names if name.startswith("linklab-")}
+        finally:
+            output_gate.set()
+            await harness.close()
+
+    run(scenario())
