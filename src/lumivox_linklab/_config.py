@@ -1,10 +1,13 @@
+import re
 import ssl
 import math
+import ipaddress
 from dataclasses import field, dataclass
 
 _ALLOWED_OUTPUT_RATES = (24_000, 48_000, 16_000)
 _CLIENT_OUTPUT_ORDER = {rate: index for index, rate in enumerate(_ALLOWED_OUTPUT_RATES)}
 _REQUIRED_CAPABILITIES = ("barge_in", "playback_accounting", "speech_spans")
+_SERVICE_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
 
 
 def _require_int(name: str, value: object, minimum: int, maximum: int | None = None) -> None:
@@ -38,6 +41,23 @@ def _require_agent(value: object) -> None:
 def _require_ssl_context(value: object) -> None:
     if value is not None and not isinstance(value, ssl.SSLContext):
         raise TypeError("ssl_context must be an SSLContext or None")
+
+
+def _require_service_id(value: object) -> None:
+    if value is None:
+        return
+    value = _require_string("discovery_service_id", value)
+    if _SERVICE_ID.fullmatch(value) is None:
+        raise ValueError("discovery_service_id must be a lowercase ASCII DNS label")
+
+
+def _is_loopback_host(host: str) -> bool:
+    if host.rstrip(".").lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _validate_output_formats(value: object, *, canonical_order: bool) -> None:
@@ -93,8 +113,10 @@ class ConnectionLimits:
 
 @dataclass(frozen=True, slots=True)
 class ClientConfig:
-    uri: str
+    uri: str | None
     output_formats: tuple[AudioFormat, ...]
+    discovery_service_id: str | None = None
+    discovery_timeout_s: float = 10.0
     ssl_context: ssl.SSLContext | None = None
     input_queue_frames: int = 16_000
     playback_queue_ms: int = 2_000
@@ -112,7 +134,12 @@ class ClientConfig:
     agent: str = "lumivox-linklab"
 
     def __post_init__(self) -> None:
-        _require_string("uri", self.uri)
+        if self.uri is not None:
+            _require_string("uri", self.uri)
+        _require_service_id(self.discovery_service_id)
+        if self.uri is None and self.discovery_service_id is None:
+            raise ValueError("uri or discovery_service_id is required")
+        _require_float("discovery_timeout_s", self.discovery_timeout_s)
         _validate_output_formats(self.output_formats, canonical_order=True)
         _require_ssl_context(self.ssl_context)
         _require_int("input_queue_frames", self.input_queue_frames, 1)
@@ -139,6 +166,7 @@ class ServerConfig:
     port: int
     output_formats: tuple[AudioFormat, ...]
     host: str = "127.0.0.1"
+    discovery_service_id: str | None = None
     ssl_context: ssl.SSLContext | None = None
     limits: ConnectionLimits = field(default_factory=ConnectionLimits)
     max_connections: int = 8
@@ -159,6 +187,9 @@ class ServerConfig:
         _require_int("port", self.port, 1, 65_535)
         _validate_output_formats(self.output_formats, canonical_order=False)
         _require_string("host", self.host)
+        _require_service_id(self.discovery_service_id)
+        if self.discovery_service_id is not None and _is_loopback_host(self.host):
+            raise ValueError("discovery cannot advertise a loopback-only host")
         _require_ssl_context(self.ssl_context)
         if not isinstance(self.limits, ConnectionLimits):
             raise TypeError("limits must be ConnectionLimits")

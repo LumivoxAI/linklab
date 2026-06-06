@@ -63,6 +63,8 @@ def _select_subprotocol(_connection: ServerConnection, offered: Sequence[Subprot
 
 
 async def _open_client_websocket(config: ClientConfig) -> _ClientHandshake:
+    if config.uri is None:
+        raise ValueError("client WebSocket connection requires a resolved URI")
     connection = await connect(
         config.uri,
         subprotocols=[_SUBPROTOCOL],

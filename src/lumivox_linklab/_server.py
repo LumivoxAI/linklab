@@ -50,6 +50,7 @@ from ._messages import (
     ConversationCancelledEvent,
 )
 from ._protocol import _Input, _Response, _TransitionResult
+from ._discovery import _register_service, _ServiceAdvertiser
 from ._handshake import _serve_websocket, _perform_server_handshake
 from ._transport import _QueueLane, _TransportCore
 from ._observability import _Observer, _QueueSnapshot, _lifecycle_boundary
@@ -1183,6 +1184,7 @@ class VoiceServer:
         self._handler_factory = handler_factory
         self._logger = logger
         self._listener: Server | None = None
+        self._advertiser: _ServiceAdvertiser | None = None
         self._serve_task: asyncio.Task[object] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._serve_started = False
@@ -1200,14 +1202,32 @@ class VoiceServer:
         self._serve_started = True
         self._close_task = None
         self._closed.clear()
-        self._accepting = True
         current = asyncio.current_task()
         assert current is not None
         self._serve_task = current
         try:
             self._listener = await _serve_websocket(self._config, self._handle_connection)
+            service_id = self._config.discovery_service_id
+            if service_id is not None:
+                self._advertiser = await _register_service(
+                    service_id,
+                    self._config.host,
+                    self._config.port,
+                    secure=self._config.ssl_context is not None,
+                )
+            self._accepting = True
         except BaseException:
             self._accepting = False
+            advertiser = self._advertiser
+            self._advertiser = None
+            if advertiser is not None:
+                with suppress(Exception):
+                    await advertiser.close()
+            listener = self._listener
+            self._listener = None
+            if listener is not None:
+                listener.close()
+                await listener.wait_closed()
             self._closed.set()
             raise
         finally:
@@ -1315,16 +1335,24 @@ class VoiceServer:
 
     async def _close(self) -> None:
         self._accepting = False
+        serve_task = self._serve_task
+        if serve_task is not None and serve_task is not asyncio.current_task():
+            serve_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await serve_task
         listener = self._listener
         if listener is None:
-            serve_task = self._serve_task
-            if serve_task is not None and serve_task is not asyncio.current_task():
-                serve_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await serve_task
             self._closed.set()
             return
         try:
+            advertiser = self._advertiser
+            self._advertiser = None
+            if advertiser is not None:
+                try:
+                    async with asyncio.timeout(self._config.close_timeout_s):
+                        await advertiser.close()
+                except (Exception, TimeoutError):
+                    pass
             sessions = tuple(self._sessions)
             if sessions:
                 await asyncio.gather(*(session._shutdown() for session in sessions))

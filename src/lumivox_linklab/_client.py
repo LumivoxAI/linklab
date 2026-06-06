@@ -7,7 +7,7 @@ from typing import Self, Protocol, runtime_checkable
 from threading import Lock
 from contextlib import suppress
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import replace, dataclass
 from collections.abc import Callable
 
 from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
@@ -43,7 +43,8 @@ from ._messages import (
     ResponseTextFinalEvent,
 )
 from ._protocol import _TransitionResult
-from ._handshake import _open_client_websocket
+from ._discovery import _ServiceBrowser, _open_service_browser
+from ._handshake import _ClientHandshake, _open_client_websocket
 from ._transport import _QueueLane, _OutboundBatch, _TransportCore
 from ._observability import _Observer, _QueueSnapshot, _lifecycle_boundary
 from ._client_ingress import _IngressLane, _IngressBatch, _ClientAudioIngress
@@ -271,6 +272,8 @@ class VoiceClient:
         self._monitor_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._reconnect_stop = asyncio.Event()
+        self._discovery: _ServiceBrowser | None = None
+        self._reconnect_discovery_revision = 0
         self._connect_started = False
         self._output_format: AudioFormat | None = None
         self._transport_loss: BaseException | None = None
@@ -447,6 +450,8 @@ class VoiceClient:
                 assert core is not None
                 await core.wait_closed()
                 outcome = core.outcome
+                if self._discovery is not None:
+                    self._reconnect_discovery_revision = self._discovery.revision
                 await self._cleanup_connection(core)
                 self._queue_connection_state(ConnectionState.DISCONNECTED, self._transport_reason())
 
@@ -473,6 +478,8 @@ class VoiceClient:
                         self._transport_loss = error
                         if not _reconnect_failure_eligible(error):
                             return
+                        if self._discovery is not None:
+                            self._reconnect_discovery_revision = self._discovery.revision
                         continue
                     backoff = self._config.reconnect_initial_s
                     break
@@ -492,7 +499,7 @@ class VoiceClient:
         self._queue_connection_state(ConnectionState.HANDSHAKING)
         core: _TransportCore | None = None
         try:
-            handshake = await _open_client_websocket(self._config)
+            handshake = await self._open_connection()
             core = _TransportCore(
                 handshake.connection,
                 role=EndpointRole.CLIENT,
@@ -550,12 +557,46 @@ class VoiceClient:
             self._core = None
 
     async def _wait_reconnect_delay(self, delay: float) -> bool:
+        discovery = self._discovery
+        if discovery is None:
+            try:
+                async with asyncio.timeout(delay):
+                    await self._reconnect_stop.wait()
+            except TimeoutError:
+                return True
+            return False
+
+        stop = self._loop.create_task(self._reconnect_stop.wait())
+        update = self._loop.create_task(discovery.wait_for_update(self._reconnect_discovery_revision))
         try:
-            async with asyncio.timeout(delay):
-                await self._reconnect_stop.wait()
-        except TimeoutError:
-            return True
-        return False
+            done, _ = await asyncio.wait((stop, update), timeout=delay, return_when=asyncio.FIRST_COMPLETED)
+            return not (stop in done and stop.result())
+        finally:
+            for task in (stop, update):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stop, update, return_exceptions=True)
+
+    async def _open_connection(self) -> _ClientHandshake:
+        if self._config.uri is not None:
+            return await _open_client_websocket(self._config)
+        service_id = self._config.discovery_service_id
+        assert service_id is not None
+        if self._discovery is None:
+            self._discovery = await _open_service_browser(service_id)
+        candidates = await self._discovery.resolve(self._config.discovery_timeout_s)
+        last_error: BaseException | None = None
+        async with asyncio.timeout(self._config.connect_timeout_s):
+            for uri in candidates:
+                try:
+                    return await _open_client_websocket(replace(self._config, uri=uri))
+                except asyncio.CancelledError:
+                    raise
+                except (OSError, TimeoutError) as error:
+                    last_error = error
+        if last_error is not None:
+            raise last_error
+        raise OSError("discovery returned no usable endpoints")
 
     async def _finish(self) -> None:
         self._observe_all_queues("client_finish")
@@ -565,6 +606,10 @@ class VoiceClient:
             if self.connection_state is not ConnectionState.DISCONNECTED:
                 self._queue_connection_state(ConnectionState.DISCONNECTED, self._transport_reason())
         await self._stop_callback_dispatcher()
+        discovery = self._discovery
+        self._discovery = None
+        if discovery is not None:
+            await discovery.close()
         self._closed.set()
 
     def _accept_inbound(self, message: Message, _transport_transition: _TransitionResult) -> None:
