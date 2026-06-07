@@ -27,6 +27,7 @@ def test_distribution_metadata() -> None:
         "lumivox-core @ git+https://github.com/LumivoxAI/core.git@master",
         "msgpack>=1.1,<2",
         "websockets>=15,<17",
+        "zeroconf>=0.151,<0.152",
     ]
 
 

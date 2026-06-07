@@ -207,6 +207,8 @@ def test_client_defaults() -> None:
     assert config == linklab.ClientConfig(
         uri="ws://localhost",
         output_formats=(PCM_16K,),
+        discovery_service_id=None,
+        discovery_timeout_s=10.0,
         ssl_context=None,
         input_queue_frames=16_000,
         playback_queue_ms=2_000,
@@ -243,6 +245,8 @@ def test_client_rejects_invalid_output_formats(formats: tuple[linklab.AudioForma
     ("name", "invalid"),
     [
         ("uri", 1),
+        ("discovery_service_id", "Production"),
+        ("discovery_timeout_s", 0),
         ("output_formats", [PCM_16K]),
         ("ssl_context", object()),
         ("input_queue_frames", 0),
@@ -285,6 +289,7 @@ def test_client_integer_fields_reject_bool(name: str) -> None:
     "name",
     [
         "connect_timeout_s",
+        "discovery_timeout_s",
         "handshake_timeout_s",
         "close_timeout_s",
         "ping_interval_s",
@@ -307,6 +312,24 @@ def test_client_reconnect_range_relation() -> None:
         _client(reconnect_initial_s=2.0, reconnect_max_s=1.0)
 
 
+def test_discovery_configuration_invariants() -> None:
+    assert _client(uri=None, discovery_service_id="production").uri is None
+    assert _client(uri="ws://direct", discovery_service_id="ignored").uri == "ws://direct"
+    with pytest.raises(ValueError, match="uri or discovery_service_id"):
+        _client(uri=None)
+    for invalid in ("", "-bad", "UPPER", "a" * 64, "bad.name", 1):
+        with pytest.raises((TypeError, ValueError)):
+            _client(discovery_service_id=invalid)
+    for accepted in ("a", "production-2", "a" * 63):
+        assert _client(discovery_service_id=accepted).discovery_service_id == accepted
+
+    for host in ("127.0.0.1", "127.1.2.3", "::1", "localhost", "LOCALHOST."):
+        with pytest.raises(ValueError, match="loopback"):
+            _server(host=host, discovery_service_id="production")
+    assert _server(host="0.0.0.0", discovery_service_id="production")
+    assert _server(host="192.0.2.1", discovery_service_id="production")
+
+
 def test_config_accepts_ssl_context() -> None:
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     assert _client(ssl_context=context).ssl_context is context
@@ -318,6 +341,7 @@ def test_server_defaults() -> None:
     assert config.port == 9000
     assert config.output_formats == (PCM_16K,)
     assert config.host == "127.0.0.1"
+    assert config.discovery_service_id is None
     assert config.ssl_context is None
     assert config.limits == linklab.ConnectionLimits()
     assert config.max_connections == 8
@@ -353,6 +377,7 @@ def test_server_rejects_invalid_output_formats(formats: tuple[linklab.AudioForma
         ("port", True),
         ("output_formats", [PCM_16K]),
         ("host", 1),
+        ("discovery_service_id", "bad_name"),
         ("ssl_context", object()),
         ("limits", object()),
         ("max_connections", 0),
@@ -422,6 +447,8 @@ def test_every_client_config_field_accepts_exact_bounds_and_rejects_adjacent_wro
     assert tuple(field.name for field in fields(linklab.ClientConfig)) == (
         "uri",
         "output_formats",
+        "discovery_service_id",
+        "discovery_timeout_s",
         "ssl_context",
         "input_queue_frames",
         "playback_queue_ms",
@@ -439,8 +466,10 @@ def test_every_client_config_field_accepts_exact_bounds_and_rejects_adjacent_wro
         "agent",
     )
     assert get_type_hints(linklab.ClientConfig) == {
-        "uri": str,
+        "uri": str | None,
         "output_formats": tuple[linklab.AudioFormat, ...],
+        "discovery_service_id": str | None,
+        "discovery_timeout_s": float,
         "ssl_context": ssl.SSLContext | None,
         "input_queue_frames": int,
         "playback_queue_ms": int,
@@ -458,6 +487,8 @@ def test_every_client_config_field_accepts_exact_bounds_and_rejects_adjacent_wro
         "agent": str,
     }
     assert _client(uri="").uri == ""
+    assert _client(discovery_service_id="production").discovery_service_id == "production"
+    assert _client(discovery_timeout_s=0.001).discovery_timeout_s == 0.001
     assert _client(output_formats=(PCM_16K,)).output_formats == (PCM_16K,)
     assert _client(ssl_context=None).ssl_context is None
     for name in ("input_queue_frames", "playback_queue_ms"):
@@ -523,6 +554,7 @@ def test_every_server_config_field_accepts_exact_bounds_and_rejects_adjacent_wro
         "port",
         "output_formats",
         "host",
+        "discovery_service_id",
         "ssl_context",
         "limits",
         "max_connections",
@@ -543,6 +575,7 @@ def test_every_server_config_field_accepts_exact_bounds_and_rejects_adjacent_wro
         "port": int,
         "output_formats": tuple[linklab.AudioFormat, ...],
         "host": str,
+        "discovery_service_id": str | None,
         "ssl_context": ssl.SSLContext | None,
         "limits": linklab.ConnectionLimits,
         "max_connections": int,
