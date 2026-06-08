@@ -4,9 +4,9 @@ import asyncio
 from typing import Self, Literal, Protocol, runtime_checkable
 from contextlib import suppress
 from collections import deque
-from dataclasses import dataclass
 from collections.abc import Callable
 
+from lumivox_core.logger import Logger
 from websockets.exceptions import ConnectionClosed as WebSocketConnectionClosed
 from websockets.asyncio.server import Server, ServerConnection
 
@@ -75,20 +75,6 @@ class ServerHandler(Protocol):
     ) -> None: ...
 
     async def on_conversation_cancelled(self, session: ServerSession, event: ConversationCancelledEvent) -> None: ...
-
-
-@dataclass(frozen=True, slots=True)
-class _HandlerQueueFull:
-    event: Message
-
-
-@dataclass(frozen=True, slots=True)
-class _HandlerRaised:
-    event: Message
-    error: Exception
-
-
-type _HandlerSignal = _HandlerQueueFull | _HandlerRaised
 
 
 class _LifecycleTimeouts:
@@ -475,11 +461,13 @@ class _HandlerQueue:
             self._available.clear()
         return event
 
-    def discard(self, predicate: Callable[[Message], bool]) -> None:
+    def discard(self, predicate: Callable[[Message], bool]) -> int:
+        discarded = 0
         retained: deque[tuple[Message, int, float]] = deque()
         while self._items:
             event, frames, enqueued_at = self._items.popleft()
             if predicate(event):
+                discarded += 1
                 if frames:
                     self._audio_frames -= frames
                 else:
@@ -489,6 +477,7 @@ class _HandlerQueue:
         self._items = retained
         if not self._items:
             self._available.clear()
+        return discarded
 
     def snapshots(self) -> tuple[_QueueSnapshot, _QueueSnapshot]:
         now = self._clock()
@@ -539,8 +528,6 @@ class ServerSession:
         self._observer = observer
         self._handler: ServerHandler | None = None
         self._events = _HandlerQueue(input_queue_frames, event_capacity, self._loop.time)
-        self._handler_signals: asyncio.Queue[_HandlerSignal] = asyncio.Queue(maxsize=_CONTROL_CAPACITY)
-        self._handler_signal_overflow = False
         self._dispatcher_task: asyncio.Task[None] | None = None
         self._server_closed_inputs: set[InputId] = set()
         self._response_writer: ResponseWriter | None = None
@@ -566,14 +553,10 @@ class ServerSession:
             and ProtocolObjectKind.RESPONSE in transition.cancellation_targets
         )
         if dispatch and not self._events.put_nowait(message):
-            self._observe_handler_queues()
-            self._record_handler_signal(_HandlerQueueFull(message))
+            self._observe_handler_queues(_lifecycle_boundary(message))
             self._handle_handler_saturation(message)
         else:
-            self._observe_handler_queues()
-        boundary = _lifecycle_boundary(message)
-        if boundary is not None:
-            self._observe_handler_queues(boundary)
+            self._observe_handler_queues(_lifecycle_boundary(message))
         if isinstance(message, InputStartedEvent):
             self._enqueue_state(CoarseState.LISTENING)
         elif isinstance(message, InputAbortedEvent):
@@ -668,6 +651,8 @@ class ServerSession:
         await asyncio.shield(self._shutdown_task)
 
     async def _shutdown_impl(self) -> None:
+        if self._observer is not None:
+            self._observer.lifecycle("session_shutdown_started")
         self._timeouts.close()
         if self._core.outcome is not None:
             await self._close_dispatcher()
@@ -712,12 +697,15 @@ class ServerSession:
             self._close_dispatcher(),
             self._core.close(1001, drain=bool(messages)),
         )
+        if self._observer is not None:
+            self._observer.lifecycle("session_shutdown_completed")
 
     def _transport_lost(self) -> None:
         """Invalidate loop-owned application work without attempting wire delivery."""
         self._timeouts.close()
         self._response_terminated(discard_output=True)
         self._events.close()
+        self._observe_handler_queues("transport_lost_cleanup")
         task = self._dispatcher_task
         if task is not None and not task.done():
             task.cancel()
@@ -767,10 +755,10 @@ class ServerSession:
 
     async def _close_dispatcher(self) -> None:
         self._check_loop()
-        self._observe_handler_queues("dispatcher_close")
         self._timeouts.close()
         self._response_terminated(discard_output=True)
         self._events.close()
+        self._observe_handler_queues("dispatcher_close")
         task = self._dispatcher_task
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
@@ -797,12 +785,9 @@ class ServerSession:
                 return
             try:
                 await self._dispatch(event)
-                if self._observer is not None:
-                    self._observer.message(event, direction="inbound", phase="handler_dispatched")
             except asyncio.CancelledError:
                 raise
             except Exception as error:
-                self._record_handler_signal(_HandlerRaised(event, error))
                 if self._observer is not None:
                     self._observer.handler_failure(event, error)
                 try:
@@ -810,11 +795,16 @@ class ServerSession:
                 except Exception as mapping_error:
                     self._core._request_close(1011, drain=False, loss=mapping_error)
                     return
+            else:
+                if self._observer is not None:
+                    self._observer.message(event, direction="inbound", phase="handler_dispatched")
 
     def _prepare_handler_event(self, event: Message) -> bool:
         if not isinstance(event, InputAudioEvent):
             return True
         if event.input_id in self._server_closed_inputs:
+            if self._observer is not None:
+                self._observer.disposition(event, "endpoint_race_discard")
             return False
         end_frame = event.start_frame + len(event.audio) // 2
         limits = self._core.validator._data.server_hello
@@ -855,9 +845,11 @@ class ServerSession:
             state = self._next_state(CoarseState.WAITING)
             self._enqueue_control((error,) if state is None else (error, state))
             self._server_closed_inputs.add(event.input_id)
-            self._events.discard(
+            discarded = self._events.discard(
                 lambda queued: isinstance(queued, InputAudioEvent) and queued.input_id == event.input_id
             )
+            if discarded:
+                self._observe_handler_queues("handler_failure_discard")
             return
         if isinstance(event, (PlaybackFinishedEvent, PlaybackInterruptedEvent)):
             response = self._core.validator._current_response(self._core.validator._data, conversation)
@@ -898,12 +890,6 @@ class ServerSession:
         elif isinstance(event, ConversationCancelledEvent):
             await handler.on_conversation_cancelled(self, event)
 
-    def _record_handler_signal(self, signal: _HandlerSignal) -> None:
-        try:
-            self._handler_signals.put_nowait(signal)
-        except asyncio.QueueFull:
-            self._handler_signal_overflow = True
-
     def _observe_handler_queues(self, boundary: str | None = None) -> None:
         if self._observer is not None:
             self._observer.queue_snapshots(self._events.snapshots(), boundary=boundary)
@@ -927,7 +913,11 @@ class ServerSession:
         state = self._next_state(CoarseState.WAITING)
         self._enqueue_control((error,) if state is None else (error, state))
         self._server_closed_inputs.add(message.input_id)
-        self._events.discard(lambda event: isinstance(event, InputAudioEvent) and event.input_id == message.input_id)
+        discarded = self._events.discard(
+            lambda event: isinstance(event, InputAudioEvent) and event.input_id == message.input_id
+        )
+        if discarded:
+            self._observe_handler_queues("handler_overflow_discard")
 
     def _enqueue_control(self, messages: tuple[Message, ...]) -> None:
         try:
@@ -1104,6 +1094,8 @@ class ServerSession:
         if key is None or key[0] != phase:
             self._timeouts.sync()
             return
+        if self._observer is not None:
+            self._observer.lifecycle("lifecycle_timeout", timeout_kind=phase)
         conversation_id = self._require_conversation_id()
         conversation = self._core.validator._data.conversation
         assert conversation is not None
@@ -1141,6 +1133,8 @@ class ServerSession:
         if key is None or key[0] in ("input", "response"):
             self._timeouts.sync()
             return
+        if self._observer is not None:
+            self._observer.lifecycle("lifecycle_timeout", timeout_kind="idle")
         self._expire_conversation(self._require_conversation_id())
 
     def _expire_conversation(self, conversation_id: ConversationId) -> None:
@@ -1170,7 +1164,7 @@ class VoiceServer:
         self,
         config: ServerConfig,
         handler_factory: Callable[[ServerSession], ServerHandler],
-        logger: object,
+        logger: Logger,
     ) -> None:
         try:
             self._loop = asyncio.get_running_loop()
@@ -1183,6 +1177,12 @@ class VoiceServer:
         self._config = config
         self._handler_factory = handler_factory
         self._logger = logger
+        self._observer = _Observer(
+            logger,
+            endpoint_role=EndpointRole.SERVER.value,
+            connection_id="server-listener",
+            clock=self._loop.time,
+        )
         self._listener: Server | None = None
         self._advertiser: _ServiceAdvertiser | None = None
         self._serve_task: asyncio.Task[object] | None = None
@@ -1205,18 +1205,40 @@ class VoiceServer:
         current = asyncio.current_task()
         assert current is not None
         self._serve_task = current
+        started = self._loop.time()
+        self._observer.lifecycle(
+            "listener_starting",
+            port=self._config.port,
+            secure=self._config.ssl_context is not None,
+        )
         try:
             self._listener = await _serve_websocket(self._config, self._handle_connection)
+            self._observer.lifecycle(
+                "listener_started",
+                port=self._config.port,
+                duration_ms=(self._loop.time() - started) * 1_000,
+            )
             service_id = self._config.discovery_service_id
             if service_id is not None:
-                self._advertiser = await _register_service(
-                    service_id,
-                    self._config.host,
-                    self._config.port,
-                    secure=self._config.ssl_context is not None,
-                )
+                self._observer.lifecycle("advertisement_registering", service_id=service_id)
+                try:
+                    self._advertiser = await _register_service(
+                        service_id,
+                        self._config.host,
+                        self._config.port,
+                        secure=self._config.ssl_context is not None,
+                    )
+                except BaseException as error:
+                    self._observer.failure("advertisement_register_failed", error, service_id=service_id)
+                    raise
+                self._observer.lifecycle("advertisement_registered", service_id=service_id)
             self._accepting = True
-        except BaseException:
+        except BaseException as error:
+            self._observer.failure(
+                "listener_start_failed",
+                error,
+                duration_ms=(self._loop.time() - started) * 1_000,
+            )
             self._accepting = False
             advertiser = self._advertiser
             self._advertiser = None
@@ -1253,6 +1275,13 @@ class VoiceServer:
 
     async def _handle_connection(self, connection: ServerConnection) -> None:
         if not self._accepting or len(self._connections) >= self._config.max_connections:
+            self._observer.lifecycle(
+                "admission_decision",
+                outcome="rejected",
+                active_connections=len(self._connections),
+                max_connections=self._config.max_connections,
+                close_code=1008,
+            )
             await connection.close(code=1008)
             return
         self._connections.add(connection)
@@ -1263,13 +1292,23 @@ class VoiceServer:
             connection_id=f"server-{self._connection_serial}",
             clock=self._loop.time,
         )
-        observer.lifecycle("connection_accepted", active_connections=len(self._connections))
+        observer.lifecycle(
+            "admission_decision",
+            outcome="accepted",
+            active_connections=len(self._connections),
+            max_connections=self._config.max_connections,
+        )
         core: _TransportCore | None = None
         session: ServerSession | None = None
         try:
-            handshake = await _perform_server_handshake(connection, self._config)
+            observer.lifecycle("handshake_started")
+            handshake = await _perform_server_handshake(connection, self._config, observer=observer)
             if handshake is None:
                 return
+            observer.lifecycle(
+                "handshake_completed",
+                output_sample_rate_hz=handshake.server_hello.output_format.sample_rate_hz,
+            )
             output_capacity = max(
                 1,
                 handshake.server_hello.output_format.sample_rate_hz * self._config.output_queue_ms // 1_000,
@@ -1309,6 +1348,7 @@ class VoiceServer:
             if not isinstance(handler, ServerHandler):
                 raise TypeError("handler_factory must return a ServerHandler")
             session._set_handler(handler)
+            observer.lifecycle("session_started")
             core.start_handshaken(handshake.client_hello, handshake.server_hello)
             session._observe_handler_queues("ready")
             await core.wait_closed()
@@ -1332,8 +1372,11 @@ class VoiceServer:
                 await session._close_dispatcher()
                 self._sessions.discard(session)
             self._connections.discard(connection)
+            observer.lifecycle("admission_released", active_connections=len(self._connections))
 
     async def _close(self) -> None:
+        started = self._loop.time()
+        self._observer.lifecycle("server_shutdown_started", active_sessions=len(self._sessions))
         self._accepting = False
         serve_task = self._serve_task
         if serve_task is not None and serve_task is not asyncio.current_task():
@@ -1349,17 +1392,24 @@ class VoiceServer:
             self._advertiser = None
             if advertiser is not None:
                 try:
+                    self._observer.lifecycle("advertisement_unregistering")
                     async with asyncio.timeout(self._config.close_timeout_s):
                         await advertiser.close()
-                except (Exception, TimeoutError):
-                    pass
+                    self._observer.lifecycle("advertisement_unregistered")
+                except (Exception, TimeoutError) as error:
+                    self._observer.failure("advertisement_unregister_failed", error)
             sessions = tuple(self._sessions)
             if sessions:
                 await asyncio.gather(*(session._shutdown() for session in sessions))
             listener.close()
             await listener.wait_closed()
+            self._observer.lifecycle("listener_stopped")
         finally:
             self._listener = None
+            self._observer.lifecycle(
+                "server_shutdown_completed",
+                duration_ms=(self._loop.time() - started) * 1_000,
+            )
             self._closed.set()
 
     def _check_loop(self) -> None:

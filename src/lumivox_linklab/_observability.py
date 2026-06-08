@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from enum import Enum
 from dataclasses import dataclass
-from collections.abc import Mapping, Callable
+from collections.abc import Callable
+
+from lumivox_core.logger import Logger
 
 from ._messages import (
     Message,
@@ -47,46 +49,23 @@ class _MessageObservation:
     fields: tuple[tuple[str, object], ...]
 
 
-class _SafeLogger:
-    """Contain logger failures and expose only explicitly selected fields."""
-
-    def __init__(self, logger: object, context: Mapping[str, object] | None = None) -> None:
-        self._logger = logger
-        self._context = dict(context or ())
-
-    def bind(self, **values: object) -> _SafeLogger:
-        context = {**self._context, **values}
-        try:
-            bound = getattr(self._logger, "bind")(**values)
-        except Exception:
-            bound = self._logger
-        return _SafeLogger(bound, context)
-
-    def emit(self, level: str, event: str, **fields: object) -> None:
-        safe_fields = {**self._context, **fields}
-        try:
-            method = getattr(self._logger, level)
-            method(event, **safe_fields)
-        except Exception:
-            pass
-
-
 class _Observer:
     def __init__(
         self,
-        logger: object,
+        logger: Logger,
         *,
         endpoint_role: str,
         connection_id: str,
         clock: Callable[[], float],
     ) -> None:
-        self._logger = _SafeLogger(logger).bind(
+        self._logger = logger.bind(
             component="lumivox_linklab",
             endpoint_role=endpoint_role,
             connection_id=connection_id,
         )
         self._clock = clock
         self._debug_counts: dict[tuple[str, str, str], int] = {}
+        self._queue_debug_counts: dict[str, int] = {}
         self._queue_states: dict[str, _QueueSnapshot] = {}
         self._input_terminal_at: dict[int, float] = {}
         self._response_inputs: dict[int, int] = {}
@@ -99,15 +78,15 @@ class _Observer:
         self._first_pcm_responses: set[int] = set()
 
     def lifecycle(self, event: str, **fields: object) -> None:
-        self._logger.emit("info", event, **fields)
+        self._logger.info(event, **fields)
 
     def failure(self, event: str, error: BaseException | None = None, **fields: object) -> None:
         if error is not None:
             fields["exception_type"] = type(error).__name__
-        self._logger.emit("error", event, **fields)
+        self._logger.error(event, **fields)
 
     def rtt(self, seconds: float) -> None:
-        self._logger.emit("debug", "keepalive_rtt", rtt_ms=max(0.0, seconds * 1_000))
+        self._logger.debug("keepalive_rtt", rtt_ms=max(0.0, seconds * 1_000))
 
     def queue_snapshots(self, snapshots: tuple[_QueueSnapshot, ...], *, boundary: str | None = None) -> None:
         for snapshot in snapshots:
@@ -124,11 +103,11 @@ class _Observer:
             }
             if boundary is not None:
                 fields["boundary"] = boundary
-                self._logger.emit("info", "queue_snapshot", **fields)
+                self._logger.info("queue_snapshot", **fields)
             elif snapshot.overflow_count > (0 if previous is None else previous.overflow_count):
-                self._logger.emit("warning", "queue_overflow", **fields)
-            elif snapshot != previous:
-                self._logger.emit("debug", "queue_snapshot", **fields)
+                self._logger.warning("queue_overflow", **fields)
+            elif snapshot != previous and self._allow_queue_debug(snapshot.identity):
+                self._logger.debug("queue_snapshot", **fields)
 
     def message(self, message: Message, *, direction: str, phase: str) -> None:
         fields = _message_fields(message)
@@ -141,9 +120,16 @@ class _Observer:
         )
         if frequent:
             if self._allow_debug(type(message).__name__, direction, phase):
-                self._logger.emit("debug", "protocol_message", **fields)
+                self._logger.debug("protocol_message", **fields)
             return
-        self._logger.emit("info", "protocol_message", **fields)
+        self._logger.info("protocol_message", **fields)
+
+    def disposition(self, message: Message, disposition: str) -> None:
+        self._logger.info(
+            "protocol_message_disposition",
+            **_message_fields(message),
+            disposition=disposition,
+        )
 
     def project(self, message: Message) -> _MessageObservation:
         return _MessageObservation(type(message).__name__, tuple(_message_fields(message).items()))
@@ -166,7 +152,10 @@ class _Observer:
         }
         if frequent and not self._allow_debug(observation.family, direction, phase):
             return
-        self._logger.emit("debug" if frequent else "info", "protocol_message", **fields)
+        if frequent:
+            self._logger.debug("protocol_message", **fields)
+        else:
+            self._logger.info("protocol_message", **fields)
 
     def callback_failure(self, message: Message, error: BaseException) -> None:
         self.failure("application_callback_failed", error, **_message_fields(message))
@@ -180,19 +169,24 @@ class _Observer:
         self._debug_counts[key] = count
         return count == 1 or count % 64 == 0
 
+    def _allow_queue_debug(self, identity: str) -> bool:
+        count = self._queue_debug_counts.get(identity, 0) + 1
+        self._queue_debug_counts[identity] = count
+        return count == 1 or count % 64 == 0
+
     def _stage_fields(self, message: Message, phase: str) -> dict[str, object]:
         now = self._clock()
         fields: dict[str, object] = {}
-        if isinstance(message, InputStartedEvent):
+        if isinstance(message, InputStartedEvent) and phase in ("queued", "received"):
             self._input_started_at[int(message.conversation_id)] = now
             if message.reason.value == "barge_in":
                 self._barge_in_at[int(message.input_id)] = now
                 fields["latency_marker"] = "barge_in_started"
-        if isinstance(message, StateEvent) and message.state.value == "listening":
+        if isinstance(message, StateEvent) and message.state.value == "listening" and phase in ("queued", "received"):
             started = self._input_started_at.get(int(message.conversation_id))
             if started is not None:
                 fields["input_start_to_listening_ms"] = (now - started) * 1_000
-        if isinstance(message, InputClosedEvent):
+        if isinstance(message, InputClosedEvent) and phase in ("queued", "received"):
             self._input_terminal_at[int(message.input_id)] = now
             fields["latency_marker"] = "input_endpoint"
             last_speech = self._last_speech_at.get(int(message.input_id))
@@ -200,7 +194,7 @@ class _Observer:
                 fields["last_speech_to_endpoint_ms"] = (now - last_speech) * 1_000
         elif isinstance(message, InputAudioEvent):
             key = (int(message.input_id), message.start_frame)
-            if message.speech:
+            if message.speech and phase in ("queued", "received"):
                 self._last_speech_at[int(message.input_id)] = now
                 fields["latency_marker"] = "speech_audio"
             if phase == "received":
@@ -208,11 +202,11 @@ class _Observer:
                 fields["latency_marker"] = "input_audio_received"
             elif phase == "handler_dispatched" and key in self._input_received_at:
                 fields["input_receipt_to_handler_ms"] = (now - self._input_received_at.pop(key)) * 1_000
-        elif isinstance(message, TranscriptFinalEvent):
+        elif isinstance(message, TranscriptFinalEvent) and phase in ("queued", "received"):
             fields.update(self._since_input_terminal(message.input_id, "endpoint_to_final_ms"))
-        elif isinstance(message, ResponseStartedEvent):
+        elif isinstance(message, ResponseStartedEvent) and phase in ("queued", "received"):
             self._response_inputs[int(message.response_id)] = int(message.input_id)
-        elif isinstance(message, (ResponseTextDeltaEvent, ResponseTextFinalEvent)):
+        elif isinstance(message, (ResponseTextDeltaEvent, ResponseTextFinalEvent)) and phase in ("queued", "received"):
             input_id = self._response_inputs.get(int(message.response_id))
             response_id = int(message.response_id)
             if input_id is not None and response_id not in self._first_text_responses:
@@ -221,7 +215,12 @@ class _Observer:
         elif isinstance(message, OutputAudioEvent):
             input_id = self._response_inputs.get(int(message.response_id))
             response_id = int(message.response_id)
-            if input_id is not None and message.start_frame == 0 and response_id not in self._first_pcm_responses:
+            if (
+                phase in ("queued", "received")
+                and input_id is not None
+                and message.start_frame == 0
+                and response_id not in self._first_pcm_responses
+            ):
                 self._first_pcm_responses.add(response_id)
                 fields.update(self._since_input_terminal(input_id, "endpoint_to_first_pcm_ms"))
             key = (int(message.output_id), message.start_frame)
@@ -229,11 +228,13 @@ class _Observer:
                 self._output_received_at[key] = now
                 fields["latency_marker"] = "output_pcm_received"
             elif phase == "callback_dispatched" and key in self._output_received_at:
-                fields["pcm_receipt_to_callback_ms"] = (now - self._output_received_at.pop(key)) * 1_000
-        elif isinstance(message, PlaybackInterruptedEvent) and message.reason.value == "barge_in":
+                fields["pcm_receipt_to_callback_completion_ms"] = (now - self._output_received_at.pop(key)) * 1_000
+                fields["latency_marker"] = "playback_callback_completed"
+        elif isinstance(message, PlaybackInterruptedEvent) and message.reason.value == "barge_in" and phase == "queued":
             if self._barge_in_at:
                 started = self._barge_in_at.pop(next(reversed(self._barge_in_at)))
-                fields["barge_in_to_interruption_ms"] = (now - started) * 1_000
+                fields["barge_in_to_interruption_report_ms"] = (now - started) * 1_000
+                fields["latency_marker"] = "interruption_report_queued"
         return fields
 
     def _since_input_terminal(self, input_id: object, field: str) -> dict[str, object]:

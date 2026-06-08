@@ -14,7 +14,25 @@ from ._enums import ErrorCode, ErrorScope, EndpointRole, ConnectionState, Messag
 from ._config import ConnectionLimits
 from ._errors import CodecError, QueueOverflow, ConnectionClosed, ProtocolViolation
 from ._values import InputId
-from ._messages import Message, ErrorEvent, ClientHello, ServerHello
+from ._messages import (
+    Message,
+    ErrorEvent,
+    StateEvent,
+    ClientHello,
+    ServerHello,
+    InputAudioEvent,
+    InputClosedEvent,
+    OutputAudioEvent,
+    OutputEndedEvent,
+    InputAbortedEvent,
+    OutputStartedEvent,
+    ResponseEndedEvent,
+    ConversationEndedEvent,
+    ResponseCancelledEvent,
+    ResponseTextDeltaEvent,
+    ResponseTextFinalEvent,
+    ConversationCancelledEvent,
+)
 from ._protocol import ProtocolValidator, _TransitionResult
 from ._observability import _Observer, _QueueSnapshot, _lifecycle_boundary, _MessageObservation
 
@@ -344,7 +362,10 @@ class _TransportCore:
 
     def discard_queued(self, predicate: Callable[[_OutboundBatch], bool]) -> tuple[_OutboundBatch, ...]:
         self._check_loop()
-        return self._queue.discard(predicate)
+        discarded = self._queue.discard(predicate)
+        if discarded:
+            self._observe_queues("queue_discard")
+        return discarded
 
     def seal_orderly(self, messages: tuple[Message, ...]) -> None:
         """Discard ordinary backlog and retain one validated terminal batch."""
@@ -412,6 +433,12 @@ class _TransportCore:
                 if self._observer is not None:
                     for message in wire_messages:
                         self._observer.message(message, direction="outbound", phase="queued")
+                self._observe_queues(
+                    next(
+                        (value for item in wire_messages if (value := _lifecycle_boundary(item)) is not None),
+                        None,
+                    )
+                )
             elif following:
                 raise ValueError("following messages require an input terminal")
             return messages
@@ -476,11 +503,31 @@ class _TransportCore:
                     return
                 if result.outbound:
                     encoded = tuple(_encode_message_with_limits(item, self._limits) for item in result.outbound)
-                    self._queue.put_nowait(encoded, lane=_QueueLane.CONTROL, weight=len(encoded))
+                    observations = (
+                        ()
+                        if self._observer is None
+                        else tuple(self._observer.project(item) for item in result.outbound)
+                    )
+                    self._queue.put_nowait(
+                        encoded,
+                        lane=_QueueLane.CONTROL,
+                        weight=len(encoded),
+                        observations=observations,
+                    )
                 self._validator._data = data
                 if self._observer is not None:
                     self._observer.message(message, direction="inbound", phase="received")
-                self._observe_queues(_lifecycle_boundary(message))
+                    for outbound in result.outbound:
+                        self._observer.message(outbound, direction="outbound", phase="queued")
+                    if not result.dispatch:
+                        self._observer.disposition(message, _ignored_disposition(message))
+                boundary = _lifecycle_boundary(message)
+                if boundary is None:
+                    boundary = next(
+                        (value for item in result.outbound if (value := _lifecycle_boundary(item)) is not None),
+                        None,
+                    )
+                self._observe_queues(boundary)
                 try:
                     self._on_transition(message, result)
                 except Exception as error:
@@ -576,6 +623,12 @@ class _TransportCore:
         )
         self._queue.seal(terminal_frames, observations)
         if self._observer is not None:
+            if terminal_frames:
+                self._observer.message(
+                    ErrorEvent(ErrorScope.CONNECTION, code, True),
+                    direction="outbound",
+                    phase="queued",
+                )
             self._observer.failure("transport_protocol_fatal", cause, code=code.value)
         self._observe_queues("protocol_fatal")
         return self._request_close(1002, drain=True, loss=cause)
@@ -632,6 +685,13 @@ class _TransportCore:
         deadline = self._loop.time() + self._close_timeout_s
         drain_deadline = self._loop.time() + self._close_timeout_s / 2
         try:
+            if self._observer is not None:
+                self._observer.lifecycle(
+                    "transport_shutdown_started",
+                    close_code=code,
+                    drain=drain,
+                    transport_lost=transport_lost,
+                )
             if reader is not None and reader is not current and not reader.done():
                 reader.cancel()
             if keepalive is not None and keepalive is not current and not keepalive.done():
@@ -668,6 +728,12 @@ class _TransportCore:
                     pass
             self._closed.set()
             self._observe_queues("transport_disconnected")
+            if self._observer is not None:
+                self._observer.lifecycle(
+                    "transport_shutdown_completed",
+                    close_code=code,
+                    transport_lost=transport_lost,
+                )
 
     async def _join_task(
         self,
@@ -704,3 +770,33 @@ def _websocket_close_code(error: WebSocketConnectionClosed) -> int | None:
         return received.code
     sent = error.sent
     return None if sent is None else sent.code
+
+
+def _ignored_disposition(message: Message) -> str:
+    if isinstance(message, InputAudioEvent):
+        return "endpoint_race_discard"
+    if isinstance(
+        message,
+        (
+            StateEvent,
+            OutputStartedEvent,
+            OutputAudioEvent,
+            OutputEndedEvent,
+            ResponseEndedEvent,
+            ResponseTextDeltaEvent,
+            ResponseTextFinalEvent,
+        ),
+    ):
+        return "stale_discard"
+    if isinstance(
+        message,
+        (
+            InputClosedEvent,
+            InputAbortedEvent,
+            ResponseCancelledEvent,
+            ConversationEndedEvent,
+            ConversationCancelledEvent,
+        ),
+    ):
+        return "idempotent_ignore"
+    return "ignored"

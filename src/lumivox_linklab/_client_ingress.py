@@ -117,7 +117,6 @@ class _ClientAudioIngress:
         self._control_occupancy = 0
         self._overflow_count = 0
         self._control_overflow_count = 0
-        self._pre_roll_trim_count = 0
         self._notification_pending = False
         self._failure: RuntimeError | None = None
         self._notification_error: Exception | None = None
@@ -407,7 +406,7 @@ class _ClientAudioIngress:
                     "client.ingress.pre_roll",
                     self._config.waiting_pre_roll_frames,
                     self._pre_roll_frames,
-                    self._pre_roll_trim_count,
+                    0,
                     pre_roll_residence,
                     "frames",
                 ),
@@ -668,7 +667,6 @@ class _ClientAudioIngress:
         self._pre_roll.append(span)
         self._pre_roll_frames += span.frames
         while self._pre_roll_frames > capacity:
-            self._pre_roll_trim_count += 1
             first = self._pre_roll.popleft()
             excess = self._pre_roll_frames - capacity
             if first.frames > excess:

@@ -23,6 +23,7 @@ from ._config import (
 from ._errors import CodecError, ConnectionClosed
 from ._schema import known_message_types, decode_schema_message
 from ._messages import ErrorEvent, ClientHello, ServerHello
+from ._observability import _Observer
 
 _SUBPROTOCOL = Subprotocol("lumivox.voice.v1")
 _VERSION = 1
@@ -118,8 +119,15 @@ async def _open_client_websocket(config: ClientConfig) -> _ClientHandshake:
         raise
 
 
-async def _perform_server_handshake(connection: ServerConnection, config: ServerConfig) -> _ServerHandshake | None:
+async def _perform_server_handshake(
+    connection: ServerConnection,
+    config: ServerConfig,
+    *,
+    observer: _Observer | None = None,
+) -> _ServerHandshake | None:
     if connection.subprotocol != _SUBPROTOCOL:
+        if observer is not None:
+            observer.lifecycle("handshake_rejected", code=ErrorCode.UNSUPPORTED_VERSION.value, close_code=1002)
         await connection.close(code=1002)
         return None
     try:
@@ -127,24 +135,24 @@ async def _perform_server_handshake(connection: ServerConnection, config: Server
             async with asyncio.timeout(config.handshake_timeout_s):
                 frame = await connection.recv()
         except TimeoutError:
-            await _reject_server_handshake(connection, ErrorCode.HANDSHAKE_TIMEOUT)
+            await _reject_server_handshake(connection, ErrorCode.HANDSHAKE_TIMEOUT, observer)
             return None
 
         if type(frame) is not bytes:
-            await _reject_server_handshake(connection, ErrorCode.MALFORMED_MESSAGE)
+            await _reject_server_handshake(connection, ErrorCode.MALFORMED_MESSAGE, observer)
             return None
         try:
             message = _decode_first_message(frame, MessageDirection.CLIENT_TO_SERVER)
         except _InvalidHello as error:
-            await _reject_server_handshake(connection, error.code)
+            await _reject_server_handshake(connection, error.code, observer)
             return None
         if not isinstance(message, ClientHello):
-            await _reject_server_handshake(connection, ErrorCode.PROTOCOL_STATE)
+            await _reject_server_handshake(connection, ErrorCode.PROTOCOL_STATE, observer)
             return None
 
         selected = next((item for item in message.output_formats if item in config.output_formats), None)
         if selected is None:
-            await _reject_server_handshake(connection, ErrorCode.FORMAT_MISMATCH)
+            await _reject_server_handshake(connection, ErrorCode.FORMAT_MISMATCH, observer)
             return None
         limits = _selected_limits(config.limits, selected)
         server_hello = ServerHello(_VERSION, _REQUIRED_CAPABILITIES, selected, limits, config.agent)
@@ -178,7 +186,13 @@ async def _serve_websocket(
     )
 
 
-async def _reject_server_handshake(connection: ServerConnection, code: ErrorCode) -> None:
+async def _reject_server_handshake(
+    connection: ServerConnection,
+    code: ErrorCode,
+    observer: _Observer | None = None,
+) -> None:
+    if observer is not None:
+        observer.lifecycle("handshake_rejected", code=code.value, close_code=1002)
     error = ErrorEvent(ErrorScope.CONNECTION, code, True)
     await connection.send(encode_message(error))
     await connection.close(code=1002)
