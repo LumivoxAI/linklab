@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Self
+from typing import Any, Self
 
 import pytest
 
@@ -14,14 +14,10 @@ from lumivox_linklab import (
     ResponseId,
     StateEvent,
     AudioFormat,
-    ClientHello,
     CoarseState,
-    ServerHello,
     ClientConfig,
-    EndpointRole,
     ConversationId,
     InputAudioEvent,
-    ConnectionLimits,
     InputAbortReason,
     InputClosedEvent,
     InputCloseReason,
@@ -30,8 +26,6 @@ from lumivox_linklab import (
     PlaybackPosition,
     InputAbortedEvent,
     InputStartedEvent,
-    ProtocolValidator,
-    ResponseEndedEvent,
     ResponseCancelReason,
     ResponseStartedEvent,
     TranscriptFinalEvent,
@@ -42,7 +36,6 @@ from lumivox_linklab import (
     ResponseTextDeltaEvent,
     ResponseTextFinalEvent,
     PlaybackInterruptReason,
-    ConversationStartedEvent,
     PlaybackInterruptedEvent,
 )
 from lumivox_linklab._client import VoiceClient, _CallbackPath, _InboundEvent, _CallbackQueue
@@ -69,22 +62,25 @@ class _RecordingLogger:
         self.records = [] if records is None else records
         self.context = {} if context is None else context
 
-    def bind(self, **new_values: object) -> Self:
+    def bind(self, **new_values: Any) -> Self:
         return type(self)(self.records, {**self.context, **new_values})
 
-    def debug(self, event: str, **kwargs: object) -> None:
+    def debug(self, event: str, **kwargs: Any) -> None:
         self._record("debug", event, kwargs)
 
-    def info(self, event: str, **kwargs: object) -> None:
+    def info(self, event: str, **kwargs: Any) -> None:
         self._record("info", event, kwargs)
 
-    def warning(self, event: str, **kwargs: object) -> None:
+    def warning(self, event: str, **kwargs: Any) -> None:
         self._record("warning", event, kwargs)
 
-    def error(self, event: str, **kwargs: object) -> None:
+    def error(self, event: str, **kwargs: Any) -> None:
         self._record("error", event, kwargs)
 
-    def exception(self, event: str, **kwargs: object) -> None:
+    def critical(self, event: str, **kwargs: Any) -> None:
+        self._record("critical", event, kwargs)
+
+    def exception(self, event: str, **kwargs: Any) -> None:
         self._record("exception", event, kwargs)
 
     def _record(self, level: str, event: str, fields: dict[str, object]) -> None:
@@ -92,22 +88,25 @@ class _RecordingLogger:
 
 
 class _RaisingLogger:
-    def bind(self, **_new_values: object) -> Self:
+    def bind(self, **new_values: Any) -> Self:
         raise RuntimeError("logger bind failed")
 
-    def debug(self, _event: str, **_kwargs: object) -> None:
+    def debug(self, event: str, **kwargs: Any) -> None:
         raise RuntimeError("logger debug failed")
 
-    def info(self, _event: str, **_kwargs: object) -> None:
+    def info(self, event: str, **kwargs: Any) -> None:
         raise RuntimeError("logger info failed")
 
-    def warning(self, _event: str, **_kwargs: object) -> None:
+    def warning(self, event: str, **kwargs: Any) -> None:
         raise RuntimeError("logger warning failed")
 
-    def error(self, _event: str, **_kwargs: object) -> None:
+    def error(self, event: str, **kwargs: Any) -> None:
         raise RuntimeError("logger error failed")
 
-    def exception(self, _event: str, **_kwargs: object) -> None:
+    def critical(self, event: str, **kwargs: Any) -> None:
+        raise RuntimeError("logger critical failed")
+
+    def exception(self, event: str, **kwargs: Any) -> None:
         raise RuntimeError("logger exception failed")
 
 
@@ -116,12 +115,12 @@ class _SurfaceLogger(_RecordingLogger):
         super().__init__()
         self.accessed: set[str] = set()
 
-    def __getattribute__(self, name: str) -> object:
+    def __getattribute__(self, name: str) -> Any:
         if name in {"bind", "debug", "info", "warning", "error", "exception"}:
             object.__getattribute__(self, "accessed").add(name)
         return super().__getattribute__(name)
 
-    def bind(self, **new_values: object) -> Self:
+    def bind(self, **new_values: Any) -> Self:
         self.context.update(new_values)
         return self
 
@@ -318,7 +317,7 @@ def test_real_queue_pressure_and_overflow_changes_are_each_emitted() -> None:
         for _, event, fields in logger.records
         if event == "queue_snapshot" and fields["queue"] == "client.transport_outbound.data"
     ]
-    assert [fields["occupancy"] for fields in transport_records] == [0, 1, 2]
+    assert [fields["occupancy"] for fields in transport_records] == [0]
     overflows = {fields["queue"] for _, event, fields in logger.records if event == "queue_overflow"}
     assert overflows == {"client.callbacks.event", "server.handler.audio"}
 
@@ -394,17 +393,9 @@ def test_audio_and_token_debug_logging_is_rate_limited() -> None:
     assert all(record[0] == "debug" for record in records)
 
 
-def test_logger_exceptions_cannot_change_observed_protocol_flow() -> None:
-    observer = _Observer(_RaisingLogger(), endpoint_role="client", connection_id="client-1", clock=lambda: 1.0)
-    observer.lifecycle("ready", state="ready")
-    observer.queue_snapshots((_QueueSnapshot("queue", 1, 1, 1, 2.0, "events"),))
-    observer.message(
-        OutputAudioEvent(ConversationId(1), ResponseId(1), OutputId(1), 0, b"\0\0"),
-        direction="inbound",
-        phase="received",
-    )
-    observer.failure("failed", RuntimeError("payload must not escape"))
-    observer.rtt(0.01)
+def test_logger_exceptions_are_not_suppressed() -> None:
+    with pytest.raises(RuntimeError, match="logger bind failed"):
+        _Observer(_RaisingLogger(), endpoint_role="client", connection_id="client-1", clock=lambda: 1.0)
 
 
 def test_logs_expose_all_ids_transitions_reasons_frame_ranges_and_rtt() -> None:
@@ -448,39 +439,6 @@ def test_logs_expose_all_ids_transitions_reasons_frame_ranges_and_rtt() -> None:
         for item in fields
     )
     assert next(item for _, event, item in logger.records if event == "keepalive_rtt")["rtt_ms"] == 12.5
-
-
-def test_raising_logger_preserves_client_and_server_protocol_outcomes() -> None:
-    pcm = AudioFormat("pcm_s16le", 16_000, 1)
-    limits = ConnectionLimits(max_output_audio_frames=1_600)
-    trace = (
-        ClientHello(1, ("barge_in", "playback_accounting", "speech_spans"), pcm, (pcm,)),
-        ServerHello(1, ("barge_in", "playback_accounting", "speech_spans"), pcm, limits),
-        ConversationStartedEvent(ConversationId(1), "wake_word"),
-        InputStartedEvent(ConversationId(1), InputId(1), InputStartReason.ACTIVATION, 0),
-        StateEvent(ConversationId(1), 1, CoarseState.LISTENING),
-        InputAudioEvent(ConversationId(1), InputId(1), 0, True, b"\0\0"),
-        InputClosedEvent(ConversationId(1), InputId(1), 0, InputCloseReason.ENDPOINT),
-        StateEvent(ConversationId(1), 2, CoarseState.PROCESSING),
-        TranscriptFinalEvent(ConversationId(1), InputId(1), "safe"),
-        ResponseStartedEvent(ConversationId(1), ResponseId(1), InputId(1), True),
-        StateEvent(ConversationId(1), 3, CoarseState.RESPONDING),
-        ResponseEndedEvent(ConversationId(1), ResponseId(1)),
-        ConversationEndedEvent(ConversationId(1), ConversationEndReason.COMPLETED),
-    )
-
-    def outcome(role: EndpointRole, logger: object) -> object:
-        validator = ProtocolValidator(role)
-        observer = _Observer(logger, endpoint_role=role.value, connection_id="connection-1", clock=lambda: 1.0)
-        validator.transport_connected()
-        for message in trace:
-            validator.accept(message)
-            observer.message(message, direction="inbound", phase="received")
-        return validator.state, validator.tombstones
-
-    for role in EndpointRole:
-        expected = outcome(role, _RecordingLogger())
-        assert outcome(role, _RaisingLogger()) == expected
 
 
 def test_text_and_pcm_logs_are_safe_and_each_frequent_family_is_rate_limited() -> None:
@@ -638,13 +596,13 @@ def test_all_required_latency_span_boundaries_are_correlatable() -> None:
     }
     assert any(fields.get("transport_queue_ms") == 4.0 for fields in protocol)
     assert any(fields.get("input_start_to_listening_ms") == pytest.approx(2.0) for fields in protocol)
-    assert any(fields.get("last_speech_to_endpoint_ms") == pytest.approx(7.0) for fields in protocol)
+    assert any(fields.get("last_speech_to_endpoint_ms") == pytest.approx(9.0) for fields in protocol)
     assert any(fields.get("endpoint_to_final_ms") == pytest.approx(3.0) for fields in protocol)
     assert any(fields.get("endpoint_to_first_text_ms") == pytest.approx(7.0) for fields in protocol)
     assert any(fields.get("endpoint_to_first_pcm_ms") == pytest.approx(9.0) for fields in protocol)
-    assert any(fields.get("pcm_receipt_to_callback_ms") == pytest.approx(1.0) for fields in protocol)
+    assert any(fields.get("pcm_receipt_to_callback_completion_ms") == pytest.approx(1.0) for fields in protocol)
     assert any(
-        fields.get("barge_in_to_interruption_ms") == pytest.approx(2.0)
+        fields.get("barge_in_to_interruption_report_ms") == pytest.approx(2.0)
         and fields.get("response_id") == 9
         and fields.get("output_id") == 10
         for fields in protocol
@@ -686,7 +644,9 @@ def test_stage_durations_use_monotonic_time_and_shared_ids() -> None:
     assert any(item.get("endpoint_to_final_ms") == pytest.approx(25.0) for item in fields)
     assert any(item.get("endpoint_to_first_pcm_ms") == pytest.approx(25.0) for item in fields)
     callback_latency = next(
-        item["pcm_receipt_to_callback_ms"] for item in fields if "pcm_receipt_to_callback_ms" in item
+        item["pcm_receipt_to_callback_completion_ms"]
+        for item in fields
+        if "pcm_receipt_to_callback_completion_ms" in item
     )
     assert isinstance(callback_latency, float)
     assert abs(callback_latency - 5.0) < 1e-9

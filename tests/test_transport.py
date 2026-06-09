@@ -6,12 +6,14 @@ import pytest
 import msgpack  # type: ignore[import-untyped]
 
 import lumivox_linklab as linklab
+from tests.helpers import RecordingLogger
 from lumivox_linklab._transport import (
     _QueueLane,
     _OutboundBatch,
     _TransportCore,
     _BoundedBatchQueue,
 )
+from lumivox_linklab._observability import _Observer
 
 CAPABILITIES = ("barge_in", "playback_accounting", "speech_spans")
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
@@ -176,6 +178,7 @@ def make_core(
     ping_interval_s: float = 20.0,
     ping_timeout_s: float = 20.0,
     on_rtt: Callable[[float], None] | None = None,
+    observer: _Observer | None = None,
 ) -> _TransportCore:
     return _TransportCore(
         transport,
@@ -190,6 +193,7 @@ def make_core(
         ping_timeout_s=ping_timeout_s,
         on_rtt=on_rtt,
         occupancy_unit="messages",
+        observer=observer,
     )
 
 
@@ -247,6 +251,82 @@ def test_enqueue_overflow_does_not_mutate_validator() -> None:
 
         assert core.validator._data == before
         assert core.snapshots()[0].occupancy == 0
+        await core.close()
+
+    run(scenario())
+
+
+def test_validator_generated_messages_share_queued_and_sent_observation_path() -> None:
+    async def scenario() -> None:
+        transport = FakeTransport()
+        logger = RecordingLogger()
+        observer = _Observer(logger, endpoint_role="server", connection_id="server-1", clock=lambda: 10.0)
+        core = make_core(
+            transport,
+            [],
+            [],
+            role=linklab.EndpointRole.SERVER,
+            observer=observer,
+        )
+        core.start_handshaken(CLIENT_HELLO, SERVER_HELLO)
+        conversation_id = linklab.ConversationId(1)
+        input_id = linklab.InputId(1)
+        response_id = linklab.ResponseId(1)
+
+        inbound = (
+            linklab.ConversationStartedEvent(conversation_id, "wake_word"),
+            linklab.InputStartedEvent(
+                conversation_id,
+                input_id,
+                linklab.InputStartReason.ACTIVATION,
+                0,
+            ),
+        )
+        for message in inbound:
+            await transport.inbound.put(linklab.encode_message(message))
+            await asyncio.sleep(0)
+        core.enqueue_batch(
+            (linklab.StateEvent(conversation_id, 1, linklab.CoarseState.LISTENING),),
+            lane=_QueueLane.CONTROL,
+        )
+        abort = linklab.InputAbortedEvent(conversation_id, input_id, linklab.InputAbortReason.CAPTURE_FAILED)
+        await transport.inbound.put(linklab.encode_message(abort))
+        await asyncio.sleep(0)
+        core.enqueue_batch(
+            (
+                linklab.StateEvent(conversation_id, 2, linklab.CoarseState.PROCESSING),
+                linklab.TranscriptFinalEvent(conversation_id, input_id, ""),
+                linklab.ResponseStartedEvent(conversation_id, response_id, input_id, False),
+                linklab.StateEvent(conversation_id, 3, linklab.CoarseState.RESPONDING),
+            ),
+            lane=_QueueLane.CONTROL,
+        )
+        barge_in = linklab.InputStartedEvent(
+            conversation_id,
+            linklab.InputId(2),
+            linklab.InputStartReason.BARGE_IN,
+            1,
+            response_id,
+        )
+        await transport.inbound.put(linklab.encode_message(barge_in))
+
+        async with asyncio.timeout(1):
+            while not any(
+                event == "protocol_message"
+                and fields.get("message_type") == "ResponseCancelledEvent"
+                and fields.get("phase") == "sent"
+                for _, event, fields in logger.records
+            ):
+                await asyncio.sleep(0)
+
+        phases = {
+            fields["phase"]
+            for _, event, fields in logger.records
+            if event == "protocol_message"
+            and fields.get("message_type") == "ResponseCancelledEvent"
+            and fields.get("reason") == "barge_in"
+        }
+        assert phases == {"queued", "sent"}
         await core.close()
 
     run(scenario())

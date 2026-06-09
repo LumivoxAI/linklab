@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Coroutine
 import pytest
 
 import lumivox_linklab as linklab
+from tests.helpers import NULL_LOGGER
 from lumivox_linklab._transport import _TransportCore
 
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
@@ -80,12 +81,12 @@ def test_facades_route_wire_transitions_through_protocol_validator() -> None:
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,)),
             FakeCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         server = linklab.VoiceServer(
             linklab.ServerConfig(1, (PCM_16K,)),
             cast(Any, lambda _session: None),
-            object(),
+            NULL_LOGGER,
         )
         core = _TransportCore(
             FakeTransport(),
@@ -110,9 +111,9 @@ def test_public_owners_bind_to_creation_loop_and_sync_handoff_uses_no_to_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with pytest.raises(RuntimeError, match="running event loop"):
-        linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), FakeCallbacks(), object())
+        linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), FakeCallbacks(), NULL_LOGGER)
     with pytest.raises(RuntimeError, match="running event loop"):
-        linklab.VoiceServer(linklab.ServerConfig(1, (PCM_16K,)), cast(Any, lambda _session: None), object())
+        linklab.VoiceServer(linklab.ServerConfig(1, (PCM_16K,)), cast(Any, lambda _session: None), NULL_LOGGER)
 
     owners: list[linklab.VoiceClient | linklab.VoiceServer] = []
 
@@ -124,12 +125,12 @@ def test_public_owners_bind_to_creation_loop_and_sync_handoff_uses_no_to_thread(
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,)),
             FakeCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         server = linklab.VoiceServer(
             linklab.ServerConfig(1, (PCM_16K,)),
             cast(Any, lambda _session: None),
-            object(),
+            NULL_LOGGER,
         )
         owners.extend((client, server))
         assert (

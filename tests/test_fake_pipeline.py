@@ -6,8 +6,10 @@ from dataclasses import field, dataclass
 from collections.abc import Callable, Coroutine
 
 import pytest
+from lumivox_core.logger import Logger
 
 import lumivox_linklab as linklab
+from tests.helpers import NULL_LOGGER, RecordingLogger
 
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
 
@@ -352,13 +354,14 @@ async def open_harness(
     server_input_queue_frames: int = 32_000,
     client_playback_queue_ms: int = 2_000,
     reconnect: bool = False,
+    logger: Logger = NULL_LOGGER,
 ) -> Harness:
     port = unused_port()
     pipeline = FakePipeline(plans)
     server = linklab.VoiceServer(
         linklab.ServerConfig(port, (PCM_16K,), input_queue_frames=server_input_queue_frames),
         lambda _session: pipeline,
-        object(),
+        logger,
     )
     await server.serve()
     callbacks = FakePlaybackCallbacks(EventJournal())
@@ -371,7 +374,7 @@ async def open_harness(
             reconnect=reconnect,
         ),
         callbacks,
-        object(),
+        logger,
     )
     if reconnect:
 
@@ -382,6 +385,52 @@ async def open_harness(
     callbacks.client = client
     await client.connect()
     return Harness(server, client, callbacks, pipeline, FakeWakelab(client, callbacks))
+
+
+def test_real_facades_emit_safe_operational_and_latency_records() -> None:
+    async def scenario() -> None:
+        logger = RecordingLogger()
+        plan = TurnPlan(
+            2,
+            "secret transcript",
+            text_deltas=("secret response",),
+            text_final="secret response",
+            output_chunks=(pcm(0x41, 2),),
+            end_conversation=True,
+        )
+        harness = await open_harness([plan], logger=logger)
+        try:
+            assert harness.wakelab.submit(pcm(0x10, 2), speech=True, activated=True) is (
+                linklab.AudioSubmitResult.ACCEPTED
+            )
+            await asyncio.wait_for(plan.done.wait(), 1)
+            await harness.callbacks.journal.wait_for(linklab.ConversationEndedEvent)
+        finally:
+            await harness.close()
+
+        events = {event for _, event, _ in logger.records}
+        assert {
+            "listener_starting",
+            "listener_started",
+            "admission_decision",
+            "handshake_started",
+            "handshake_completed",
+            "session_started",
+            "queue_snapshot",
+            "protocol_message",
+            "transport_shutdown_completed",
+            "server_shutdown_completed",
+        } <= events
+        protocol = [fields for _, event, fields in logger.records if event == "protocol_message"]
+        assert any(fields.get("phase") == "queued" for fields in protocol)
+        assert any(fields.get("phase") == "sent" for fields in protocol)
+        assert any("endpoint_to_first_pcm_ms" in fields for fields in protocol)
+        rendered = repr(logger.records)
+        assert "secret transcript" not in rendered
+        assert "secret response" not in rendered
+        assert "ws://127.0.0.1" not in rendered
+
+    run(scenario())
 
 
 def test_fake_pipeline_activation_sequential_turns_streaming_and_end_intent() -> None:
@@ -724,6 +773,7 @@ def test_fake_pipeline_playback_failure_ends_only_its_conversation(failure_owner
     async def scenario() -> None:
         producer_gate = asyncio.Event()
         response_gate = asyncio.Event()
+        logger = RecordingLogger()
         plan = TurnPlan(
             1,
             "playback",
@@ -732,7 +782,7 @@ def test_fake_pipeline_playback_failure_ends_only_its_conversation(failure_owner
             response_gate=response_gate if failure_owner == "server" else None,
             failure_stage="playback" if failure_owner == "server" else None,
         )
-        harness = await open_harness([plan])
+        harness = await open_harness([plan], logger=logger)
         if failure_owner == "client":
             harness.callbacks.fail_output = True
         try:
@@ -759,6 +809,10 @@ def test_fake_pipeline_playback_failure_ends_only_its_conversation(failure_owner
             else:
                 playback = await harness.pipeline.journal.wait_for(linklab.PlaybackInterruptedEvent)
                 assert playback.reason is linklab.PlaybackInterruptReason.PLAYBACK_FAILED
+            expected_failure = (
+                "application_callback_failed" if failure_owner == "client" else "application_handler_failed"
+            )
+            assert any(event == expected_failure for _, event, _ in logger.records)
         finally:
             producer_gate.set()
             response_gate.set()
@@ -770,7 +824,8 @@ def test_fake_pipeline_playback_failure_ends_only_its_conversation(failure_owner
 def test_fake_pipeline_input_and_processing_timeouts_emit_complete_sequences() -> None:
     async def scenario() -> None:
         plan = TurnPlan(1, "", close_input=False)
-        harness = await open_harness([plan])
+        logger = RecordingLogger()
+        harness = await open_harness([plan], logger=logger)
         try:
             assert harness.wakelab.submit(pcm(0x60, 1), speech=True, activated=True) is (
                 linklab.AudioSubmitResult.ACCEPTED
@@ -804,6 +859,16 @@ def test_fake_pipeline_input_and_processing_timeouts_emit_complete_sequences() -
             assert final.text == ""
             assert harness.callbacks.journal.events.index(error) < harness.callbacks.journal.events.index(final)
             assert harness.callbacks.journal.events.index(final) < harness.callbacks.journal.events.index(waiting)
+            timeout_kinds = {
+                fields["timeout_kind"] for _, event, fields in logger.records if event == "lifecycle_timeout"
+            }
+            assert timeout_kinds == {"input", "processing"}
+            processing_phases = {
+                fields["phase"]
+                for _, event, fields in logger.records
+                if event == "protocol_message" and fields.get("code") == linklab.ErrorCode.PROCESSING_TIMEOUT.value
+            }
+            assert processing_phases >= {"queued", "sent"}
         finally:
             await harness.close()
 
@@ -846,9 +911,10 @@ def test_fake_pipeline_waiting_timeout_ends_conversation_once() -> None:
 def test_fake_pipeline_server_input_overflow_rejects_queued_pcm_and_recovers() -> None:
     async def scenario() -> None:
         gate = asyncio.Event()
+        logger = RecordingLogger()
         saturated = TurnPlan(99, "", input_gate=gate)
         recovered = TurnPlan(1, "recovered")
-        harness = await open_harness([saturated, recovered], server_input_queue_frames=1)
+        harness = await open_harness([saturated, recovered], server_input_queue_frames=1, logger=logger)
         try:
             assert harness.wakelab.submit(pcm(0x70, 1), speech=True, activated=True) is (
                 linklab.AudioSubmitResult.ACCEPTED
@@ -887,6 +953,10 @@ def test_fake_pipeline_server_input_overflow_rejects_queued_pcm_and_recovers() -
             )
             first_input = next(iter(harness.pipeline.inputs))
             assert bytes(harness.pipeline.inputs[first_input].audio) == pcm(0x70, 1)
+            assert any(
+                event == "queue_overflow" and fields.get("queue") == "server.handler.audio"
+                for _, event, fields in logger.records
+            )
         finally:
             gate.set()
             await harness.close()

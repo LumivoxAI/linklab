@@ -6,6 +6,7 @@ from collections.abc import Coroutine
 import pytest
 
 import lumivox_linklab as linklab
+from tests.helpers import NULL_LOGGER, RecordingLogger
 from lumivox_linklab._discovery import _endpoint_uri, _usable_address, _service_candidates
 
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
@@ -108,10 +109,11 @@ class FakeBrowser:
 def test_discovery_reaches_normal_handshake_and_closes_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         port = unused_port()
+        logger = RecordingLogger()
         server = linklab.VoiceServer(
             linklab.ServerConfig(port, (PCM_16K,)),
             lambda _session: NullHandler(),
-            object(),
+            logger,
         )
         await server.serve()
         browser = FakeBrowser((f"ws://127.0.0.1:{port}",))
@@ -125,7 +127,7 @@ def test_discovery_reaches_normal_handshake_and_closes_browser(monkeypatch: pyte
         client = linklab.VoiceClient(
             linklab.ClientConfig(None, (PCM_16K,), discovery_service_id="production"),
             NullCallbacks(),
-            object(),
+            logger,
         )
         await client.connect()
         assert client.connection_state is linklab.ConnectionState.READY
@@ -139,6 +141,15 @@ def test_discovery_reaches_normal_handshake_and_closes_browser(monkeypatch: pyte
         await client.close()
         await server.close()
         assert browser.closed
+        events = {event for _, event, _ in logger.records}
+        assert {
+            "discovery_browser_started",
+            "discovery_resolution_started",
+            "discovery_resolution_completed",
+            "discovery_candidate_attempted",
+            "discovery_browser_closed",
+        } <= events
+        assert "ws://127.0.0.1" not in repr(logger.records)
 
     run(scenario())
 
@@ -149,7 +160,7 @@ def test_direct_uri_never_creates_discovery_backend(monkeypatch: pytest.MonkeyPa
         server = linklab.VoiceServer(
             linklab.ServerConfig(port, (PCM_16K,)),
             lambda _session: NullHandler(),
-            object(),
+            NULL_LOGGER,
         )
         await server.serve()
 
@@ -164,7 +175,7 @@ def test_direct_uri_never_creates_discovery_backend(monkeypatch: pytest.MonkeyPa
                 discovery_service_id="production",
             ),
             NullCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         await client.connect()
         await client.close()
@@ -178,7 +189,7 @@ def test_discovery_update_wakes_reconnect_delay() -> None:
         client = linklab.VoiceClient(
             linklab.ClientConfig(None, (PCM_16K,), discovery_service_id="production"),
             NullCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         browser = FakeBrowser(("ws://192.0.2.1:9000",))
         client._discovery = browser
@@ -195,6 +206,7 @@ def test_discovery_update_wakes_reconnect_delay() -> None:
 def test_initial_discovery_timeout_closes_browser(monkeypatch: pytest.MonkeyPatch) -> None:
     async def scenario() -> None:
         browser = FakeBrowser(())
+        logger = RecordingLogger()
 
         async def open_browser(_service_id: str) -> FakeBrowser:
             return browser
@@ -208,12 +220,17 @@ def test_initial_discovery_timeout_closes_browser(monkeypatch: pytest.MonkeyPatc
                 discovery_timeout_s=0.01,
             ),
             NullCallbacks(),
-            object(),
+            logger,
         )
         with pytest.raises(TimeoutError):
             await client.connect()
         assert browser.closed
         await client.wait_closed()
+        assert any(event == "discovery_resolution_started" for _, event, _ in logger.records)
+        assert any(
+            event == "handshake_failed" and fields.get("exception_type") == "TimeoutError"
+            for _, event, fields in logger.records
+        )
 
     run(scenario())
 
@@ -229,6 +246,7 @@ def test_server_advertisement_lifecycle_and_registration_rollback(monkeypatch: p
     async def scenario() -> None:
         calls: list[tuple[str, str, int, bool]] = []
         advertiser = Advertiser()
+        logger = RecordingLogger()
 
         async def register(service_id: str, host: str, port: int, *, secure: bool) -> Advertiser:
             calls.append((service_id, host, port, secure))
@@ -239,12 +257,18 @@ def test_server_advertisement_lifecycle_and_registration_rollback(monkeypatch: p
         server = linklab.VoiceServer(
             linklab.ServerConfig(port, (PCM_16K,), host="0.0.0.0", discovery_service_id="production"),
             lambda _session: NullHandler(),
-            object(),
+            logger,
         )
         await server.serve()
         assert calls == [("production", "0.0.0.0", port, False)]
         await server.close()
         assert advertiser.closed
+        assert {event for _, event, _ in logger.records} >= {
+            "advertisement_registering",
+            "advertisement_registered",
+            "advertisement_unregistering",
+            "advertisement_unregistered",
+        }
 
         failed_port = unused_port()
 
@@ -261,13 +285,17 @@ def test_server_advertisement_lifecycle_and_registration_rollback(monkeypatch: p
                 discovery_service_id="production",
             ),
             lambda _session: NullHandler(),
-            object(),
+            logger,
         )
         with pytest.raises(RuntimeError, match="name conflict"):
             await failed.serve()
         assert failed._listener is None
         with pytest.raises(OSError):
             await asyncio.open_connection("127.0.0.1", failed_port)
+        assert any(
+            event == "advertisement_register_failed" and fields.get("exception_type") == "RuntimeError"
+            for _, event, fields in logger.records
+        )
 
     run(scenario())
 

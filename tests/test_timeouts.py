@@ -7,6 +7,7 @@ from collections.abc import Coroutine
 import pytest
 
 import lumivox_linklab as linklab
+from tests.helpers import NULL_LOGGER
 from lumivox_linklab._handshake import _open_client_websocket
 
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
@@ -108,7 +109,7 @@ async def open_harness(
         sessions.append(session)
         return handler
 
-    server = linklab.VoiceServer(config, factory, object())
+    server = linklab.VoiceServer(config, factory, NULL_LOGGER)
     await server.serve()
     client = await _open_client_websocket(linklab.ClientConfig(f"ws://127.0.0.1:{port}", (PCM_16K,)))
     async with asyncio.timeout(1):

@@ -7,11 +7,12 @@ from typing import Any, Self, cast, get_type_hints
 from collections.abc import Coroutine
 
 import pytest
+from lumivox_core.logger import Logger
 from websockets.exceptions import ConnectionClosed
 from websockets.asyncio.client import connect
 
 import lumivox_linklab as linklab
-from lumivox_linklab._server import _HandlerRaised, _HandlerQueueFull
+from tests.helpers import NULL_LOGGER, RecordingLogger
 from lumivox_linklab._handshake import _SUBPROTOCOL, _open_client_websocket
 from lumivox_linklab._transport import _QueueLane
 
@@ -111,7 +112,7 @@ def test_server_shutdown_closes_open_input_before_conversation_and_uses_1001() -
             sessions.append(session)
             return RecordingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -152,7 +153,7 @@ def test_server_binds_returns_and_isolates_sessions_and_handlers() -> None:
             handlers.append(handler)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         first = await _open_client_websocket(client_config(config.port))
         second = await _open_client_websocket(client_config(config.port))
@@ -173,12 +174,13 @@ def test_connection_cap_rejects_with_1008_and_releases_slot() -> None:
     async def scenario() -> None:
         config = server_config(max_connections=1)
         sessions: list[linklab.ServerSession] = []
+        logger = RecordingLogger()
 
         def factory(session: linklab.ServerSession) -> RecordingHandler:
             sessions.append(session)
             return RecordingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, logger)
         await server.serve()
         first = await _open_client_websocket(client_config(config.port))
 
@@ -191,6 +193,12 @@ def test_connection_cap_rejects_with_1008_and_releases_slot() -> None:
         await rejected.wait_closed()
         assert rejected.close_code == 1008
         assert len(sessions) == 1
+        rejected_admission = next(
+            fields
+            for _, event, fields in logger.records
+            if event == "admission_decision" and fields.get("outcome") == "rejected"
+        )
+        assert rejected_admission["close_code"] == 1008
 
         await first.connection.close()
         async with asyncio.timeout(1):
@@ -210,6 +218,30 @@ def test_connection_cap_rejects_with_1008_and_releases_slot() -> None:
     run(scenario())
 
 
+def test_server_facade_logs_rejected_handshake_without_peer_payload() -> None:
+    async def scenario() -> None:
+        config = server_config()
+        logger = RecordingLogger()
+        server = linklab.VoiceServer(config, lambda _session: RecordingHandler(), logger)
+        await server.serve()
+        connection = await connect(
+            f"ws://127.0.0.1:{config.port}",
+            subprotocols=[_SUBPROTOCOL],
+            compression=None,
+            proxy=None,
+        )
+        await connection.send(b"peer-secret-invalid-msgpack")
+        await connection.wait_closed()
+        await server.close()
+
+        rejected = next(fields for _, event, fields in logger.records if event == "handshake_rejected")
+        assert rejected["code"] == linklab.ErrorCode.MALFORMED_MESSAGE.value
+        assert rejected["close_code"] == 1002
+        assert "peer-secret-invalid-msgpack" not in repr(logger.records)
+
+    run(scenario())
+
+
 def test_factory_failure_is_connection_local_and_releases_slot() -> None:
     async def scenario() -> None:
         config = server_config(max_connections=2)
@@ -224,7 +256,7 @@ def test_factory_failure_is_connection_local_and_releases_slot() -> None:
             handlers.append(handler)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         healthy = await _open_client_websocket(client_config(config.port))
         failed = await _open_client_websocket(client_config(config.port))
@@ -247,7 +279,7 @@ def test_factory_failure_is_connection_local_and_releases_slot() -> None:
 def test_serve_is_one_shot_and_context_manager_does_not_suppress() -> None:
     async def concurrent_serve() -> None:
         config = server_config()
-        server = linklab.VoiceServer(config, lambda _session: RecordingHandler(), object())
+        server = linklab.VoiceServer(config, lambda _session: RecordingHandler(), NULL_LOGGER)
         results = await asyncio.gather(server.serve(), server.serve(), return_exceptions=True)
         assert sum(result is None for result in results) == 1
         errors = [result for result in results if isinstance(result, RuntimeError)]
@@ -258,7 +290,7 @@ def test_serve_is_one_shot_and_context_manager_does_not_suppress() -> None:
 
     async def context_manager() -> None:
         config = server_config()
-        server = linklab.VoiceServer(config, lambda _session: RecordingHandler(), object())
+        server = linklab.VoiceServer(config, lambda _session: RecordingHandler(), NULL_LOGGER)
         with pytest.raises(LookupError, match="body failed"):
             async with server as entered:
                 assert entered is server
@@ -285,7 +317,7 @@ def test_voice_server_exact_async_surface_and_annotations() -> None:
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
                 annotation=get_type_hints(linklab.VoiceServer.__init__)["handler_factory"],
             ),
-            inspect.Parameter("logger", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=object),
+            inspect.Parameter("logger", inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=Logger),
         ),
         return_annotation=None,
     )
@@ -324,7 +356,7 @@ def test_server_close_is_bounded_when_handler_suppresses_cancellation() -> None:
     async def scenario() -> None:
         config = server_config(close_timeout_s=0.01)
         handler = StubbornHandler()
-        server = linklab.VoiceServer(config, lambda _session: handler, object())
+        server = linklab.VoiceServer(config, lambda _session: handler, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await send_message(
@@ -347,13 +379,13 @@ def test_server_close_is_bounded_when_handler_suppresses_cancellation() -> None:
 
 def test_close_before_serve_is_idempotent_and_ssl_context_is_caller_owned() -> None:
     async def scenario() -> None:
-        plain = linklab.VoiceServer(server_config(), lambda _session: RecordingHandler(), object())
+        plain = linklab.VoiceServer(server_config(), lambda _session: RecordingHandler(), NULL_LOGGER)
         await asyncio.gather(plain.close(), plain.close())
         await plain.wait_closed()
 
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         config = server_config(ssl_context=context)
-        server = linklab.VoiceServer(config, lambda _session: RecordingHandler(), object())
+        server = linklab.VoiceServer(config, lambda _session: RecordingHandler(), NULL_LOGGER)
         await server.serve()
         assert config.ssl_context is context
         await server.close()
@@ -365,7 +397,7 @@ def test_close_before_serve_is_idempotent_and_ssl_context_is_caller_owned() -> N
 def test_invalid_handler_result_closes_only_that_connection() -> None:
     async def scenario() -> None:
         config = server_config()
-        server = linklab.VoiceServer(config, lambda _session: cast(Any, object()), object())
+        server = linklab.VoiceServer(config, lambda _session: cast(Any, object()), NULL_LOGGER)
         await server.serve()
         handshake = await _open_client_websocket(client_config(config.port))
         await handshake.connection.wait_closed()
@@ -395,7 +427,7 @@ def test_handler_dispatches_every_inbound_event_in_validated_order(interrupted: 
             sessions.append(session)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -497,7 +529,7 @@ def test_handler_queue_full_and_callback_failure_are_explicit_signals() -> None:
             sessions.append(session)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -514,9 +546,9 @@ def test_handler_queue_full_and_callback_failure_are_explicit_signals() -> None:
         await send_message(client.connection, linklab.InputAudioEvent(conversation_id, input_id, 4, True, b"\0" * 4))
 
         session = sessions[0]
-        signal = await asyncio.wait_for(session._handler_signals.get(), 1)
-        assert isinstance(signal, _HandlerQueueFull)
-        assert cast(linklab.InputAudioEvent, signal.event).start_frame == 4
+        async with asyncio.timeout(1):
+            while session._events.snapshots()[0].overflow_count == 0:
+                await asyncio.sleep(0)
         audio_snapshot, event_snapshot = session._events.snapshots()
         assert (audio_snapshot.capacity, audio_snapshot.occupancy, audio_snapshot.overflow_count) == (2, 0, 1)
         assert event_snapshot.overflow_count == 0
@@ -582,7 +614,7 @@ def test_non_audio_handler_overflow_closes_only_affected_session() -> None:
             handlers.append(handler)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         overloaded = await _open_client_websocket(client_config(config.port))
         healthy = await _open_client_websocket(client_config(config.port))
@@ -634,7 +666,7 @@ def test_conversation_handler_failure_emits_conversation_failure_sequence() -> N
             sessions.append(session)
             return FailingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -650,9 +682,6 @@ def test_conversation_handler_failure_emits_conversation_failure_sequence() -> N
             ),
             linklab.ConversationEndedEvent(conversation_id, linklab.ConversationEndReason.SERVER_FAILED),
         ]
-        signal = await asyncio.wait_for(sessions[0]._handler_signals.get(), 1)
-        assert isinstance(signal, _HandlerRaised)
-        assert isinstance(signal.error, LookupError)
         assert client.connection.close_code is None
         await client.connection.close()
         await server.close()
@@ -694,7 +723,7 @@ def test_input_handler_failure_emits_stt_failure_sequence(phase: str) -> None:
             sessions.append(session)
             return FailingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -716,8 +745,6 @@ def test_input_handler_failure_emits_stt_failure_sequence(phase: str) -> None:
                 linklab.InputAbortedEvent(conversation_id, input_id, linklab.InputAbortReason.CAPTURE_FAILED),
             )
 
-        signal = await asyncio.wait_for(sessions[0]._handler_signals.get(), 1)
-        assert isinstance(signal, _HandlerRaised)
         messages = await receive_messages(client, 5)
         error_index = next(index for index, message in enumerate(messages) if isinstance(message, linklab.ErrorEvent))
         assert messages[error_index] == linklab.ErrorEvent(
@@ -759,7 +786,7 @@ def test_playback_handler_failure_invalidates_writer_and_ends_playback_failed() 
             sessions.append(session)
             return FailingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -785,8 +812,6 @@ def test_playback_handler_failure_invalidates_writer_and_ends_playback_failed() 
             linklab.PlaybackFinishedEvent(conversation_id, response.response_id, output.output_id, 1),
         )
 
-        signal = await asyncio.wait_for(session._handler_signals.get(), 1)
-        assert isinstance(signal, _HandlerRaised)
         messages = await receive_messages(client, 12)
         assert messages[-3:] == [
             linklab.ErrorEvent(
@@ -833,7 +858,7 @@ def test_handler_failure_does_not_overwrite_work_published_during_callback() -> 
             sessions.append(session)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         conversation_id = linklab.ConversationId(1)
@@ -845,8 +870,6 @@ def test_handler_failure_does_not_overwrite_work_published_during_callback() -> 
         )
         await send_message(client.connection, linklab.InputAudioEvent(conversation_id, input_id, 0, True, b"\0\0"))
 
-        signal = await asyncio.wait_for(sessions[0]._handler_signals.get(), 1)
-        assert isinstance(signal, _HandlerRaised)
         messages = await receive_messages(client, 6)
         assert not any(isinstance(message, linklab.ErrorEvent) for message in messages)
         assert isinstance(messages[-2], linklab.ResponseStartedEvent)
@@ -874,7 +897,7 @@ def test_internal_dispatch_failure_closes_only_affected_session_1011(monkeypatch
             handlers.append(handler)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         failed = await _open_client_websocket(client_config(config.port))
         healthy = await _open_client_websocket(client_config(config.port))
@@ -908,7 +931,7 @@ def test_endpoint_late_pcm_and_identical_terminal_events_are_not_dispatched() ->
             sessions.append(session)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -967,7 +990,7 @@ def test_endpoint_close_race_validates_late_pcm_before_discard(late_start: int) 
             sessions.append(session)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         conversation_id = linklab.ConversationId(1)
@@ -1011,7 +1034,7 @@ def test_server_session_rejects_use_from_another_event_loop() -> None:
             retained.append(session)
             return RecordingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], retained), 1)
@@ -1054,7 +1077,7 @@ def test_session_closes_at_callback_boundary_and_orders_transcripts_and_state() 
             sessions.append(session)
             return handler
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         conversation_id = linklab.ConversationId(1)
@@ -1106,7 +1129,7 @@ def test_input_fail_after_close_emits_exact_recovery_batch_and_rejects_repeat() 
             sessions.append(session)
             return RecordingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -1167,7 +1190,7 @@ def test_end_open_input_and_client_cancel_emit_terminal_batches() -> None:
             sessions.append(session)
             return RecordingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -1194,7 +1217,7 @@ def test_end_open_input_and_client_cancel_emit_terminal_batches() -> None:
     async def client_cancel() -> None:
         config = server_config()
         handler = RecordingHandler()
-        server = linklab.VoiceServer(config, lambda _session: handler, object())
+        server = linklab.VoiceServer(config, lambda _session: handler, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         conversation_id = linklab.ConversationId(1)
@@ -1230,7 +1253,7 @@ def test_session_fail_resolves_connection_conversation_and_response_scopes() -> 
             sessions.append(session)
             return RecordingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -1273,7 +1296,7 @@ def test_session_fail_resolves_connection_conversation_and_response_scopes() -> 
             sessions.append(session)
             return RecordingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)
@@ -1323,7 +1346,7 @@ def test_session_fail_resolves_connection_conversation_and_response_scopes() -> 
             sessions.append(session)
             return RecordingHandler()
 
-        server = linklab.VoiceServer(config, factory, object())
+        server = linklab.VoiceServer(config, factory, NULL_LOGGER)
         await server.serve()
         client = await _open_client_websocket(client_config(config.port))
         await wait_for_count(cast(list[object], sessions), 1)

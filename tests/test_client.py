@@ -7,7 +7,7 @@ import pytest
 from websockets.asyncio.server import Server, ServerConnection
 
 import lumivox_linklab as linklab
-from lumivox_linklab._client import _CallbackPath, _CallbackRaised, _CallbackQueueSaturated
+from tests.helpers import NULL_LOGGER, RecordingLogger
 from lumivox_linklab._handshake import _ClientHandshake, _serve_websocket, _perform_server_handshake
 from lumivox_linklab._transport import _QueueLane
 
@@ -239,7 +239,7 @@ def test_orderly_client_shutdown_sends_one_terminal_batch_and_waits_for_end(
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,), close_timeout_s=0.2),
             NullCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         await client.connect()
         await open_input(client, connection)
@@ -283,7 +283,7 @@ def test_orderly_client_shutdown_accounts_started_output_after_cancel(
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,), close_timeout_s=0.2),
             NullCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         await client.connect()
         await open_input(client, connection)
@@ -367,7 +367,7 @@ def test_loopback_facade_handoffs_capture_thread_control_and_closes_idempotently
         client = linklab.VoiceClient(
             linklab.ClientConfig(f"ws://127.0.0.1:{port}", (PCM_16K,)),
             NullCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         try:
             assert_disconnected(client)
@@ -421,7 +421,7 @@ def test_connect_is_one_shot_concurrent_safe_and_does_not_mutate_on_rejection(
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), NullCallbacks(), object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), NullCallbacks(), NULL_LOGGER)
         connecting = asyncio.create_task(client.connect())
         await entered.wait()
         before = (client.connection_state, client.output_format, client._core)
@@ -455,7 +455,7 @@ def test_context_manager_propagates_body_exception() -> None:
             client = linklab.VoiceClient(
                 linklab.ClientConfig(f"ws://127.0.0.1:{port}", (PCM_16K,)),
                 NullCallbacks(),
-                object(),
+                NULL_LOGGER,
             )
             try:
                 async with client:
@@ -484,7 +484,7 @@ def test_input_close_discards_transport_queued_audio_but_not_writer_owned(
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,), input_queue_frames=10),
             NullCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         await client.connect()
         assert (
@@ -543,7 +543,7 @@ def test_callbacks_are_ordered_include_terminal_rearm_and_stop_before_close_retu
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, NULL_LOGGER)
         await client.connect()
         await open_input(client, connection)
         await start_response(connection, end_conversation=True)
@@ -601,7 +601,7 @@ def test_non_output_callback_failure_cancels_conversation_and_dispatch_continues
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, NULL_LOGGER)
         await client.connect()
         await open_input(client, connection)
         await send_server(
@@ -612,10 +612,6 @@ def test_non_output_callback_failure_cancels_conversation_and_dispatch_continues
         async with asyncio.timeout(1):
             while not any(isinstance(event, linklab.TranscriptUpdateEvent) for event in callbacks.events):
                 await asyncio.sleep(0)
-        signal = client._callback_signals.get_nowait()
-        assert isinstance(signal, _CallbackRaised)
-        assert signal.path is _CallbackPath.EVENT
-        assert isinstance(signal.error, RuntimeError)
         assert client.connection_state is linklab.ConnectionState.READY
         await wait_for_sent(connection, 4)
         assert linklab.decode_message(
@@ -643,7 +639,7 @@ def test_output_callback_failure_flushes_output_and_reports_playback_failure(
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, NULL_LOGGER)
         await client.connect()
         await open_input(client, connection)
         await start_response(connection)
@@ -665,13 +661,6 @@ def test_output_callback_failure_flushes_output_and_reports_playback_failure(
                 b"\x03\x04",
             ),
         )
-        async with asyncio.timeout(1):
-            while client._callback_signals.empty():
-                await asyncio.sleep(0)
-
-        signal = client._callback_signals.get_nowait()
-        assert isinstance(signal, _CallbackRaised)
-        assert signal.path is _CallbackPath.OUTPUT
         await wait_for_sent(connection, 4)
         assert linklab.decode_message(
             connection.sent[-1],
@@ -704,12 +693,10 @@ def test_callback_failure_without_conversation_closes_1011(monkeypatch: pytest.M
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), FailingCallbacks(), object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), FailingCallbacks(), NULL_LOGGER)
         await client.connect()
         await client.wait_closed()
 
-        signal = client._callback_signals.get_nowait()
-        assert isinstance(signal, _CallbackRaised)
         assert connection.close_codes == [1011]
         assert_disconnected(client)
 
@@ -736,7 +723,7 @@ def test_blocked_connection_callback_queue_saturation_closes_1011(
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, NULL_LOGGER)
         await client.connect()
         await callbacks.entered.wait()
         assert client._ingress.state.conversation_id is None
@@ -745,10 +732,6 @@ def test_blocked_connection_callback_queue_saturation_closes_1011(
             client._queue_connection_state(linklab.ConnectionState.READY)
         await client._core.wait_closed()  # type: ignore[union-attr]
 
-        signal = client._callback_signals.get_nowait()
-        assert isinstance(signal, _CallbackQueueSaturated)
-        assert signal.path is _CallbackPath.CONTROL
-        assert isinstance(signal.event, linklab.ConnectionStateEvent)
         assert connection.close_codes == [1011]
         callbacks.release.set()
         await client.wait_closed()
@@ -771,7 +754,7 @@ def test_slow_non_output_callback_is_bounded_and_does_not_block_reader(monkeypat
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,), websocket_max_queue=1),
             callbacks,
-            object(),
+            NULL_LOGGER,
         )
         holder.append(client)
         await client.connect()
@@ -786,11 +769,8 @@ def test_slow_non_output_callback_is_bounded_and_does_not_block_reader(monkeypat
             linklab.TranscriptUpdateEvent(linklab.ConversationId(1), linklab.InputId(1), 2, "two"),
         )
         async with asyncio.timeout(1):
-            while client._callback_signals.empty():
+            while client._events.snapshots()[0].overflow_count == 0:
                 await asyncio.sleep(0)
-        signal = client._callback_signals.get_nowait()
-        assert isinstance(signal, _CallbackQueueSaturated)
-        assert signal.path is _CallbackPath.EVENT
         assert client._events.qsize() == 1
         assert client.connection_state is linklab.ConnectionState.READY
         assert connection.close_codes == []
@@ -825,7 +805,7 @@ def test_barge_in_flushes_queued_pcm_and_late_stale_events(monkeypatch: pytest.M
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, NULL_LOGGER)
         await client.connect()
         await open_input(client, connection)
         await start_response(connection)
@@ -885,7 +865,7 @@ def test_barge_in_flushes_all_queued_stale_response_callbacks(monkeypatch: pytes
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, NULL_LOGGER)
         await client.connect()
         await open_input(client, connection)
         await start_response(connection, end_conversation=True)
@@ -946,7 +926,7 @@ def test_callback_failure_after_barge_in_cannot_fail_stale_playback(monkeypatch:
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), callbacks, NULL_LOGGER)
         await client.connect()
         await open_input(client, connection)
         await start_response(connection)
@@ -964,9 +944,6 @@ def test_callback_failure_after_barge_in_cannot_fail_stale_playback(monkeypatch:
             is linklab.AudioSubmitResult.ACCEPTED
         )
         callbacks.release.set()
-        async with asyncio.timeout(1):
-            while client._callback_signals.empty():
-                await asyncio.sleep(0)
         await wait_for_sent(connection, 5)
 
         sent = [
@@ -1003,7 +980,7 @@ def test_slow_output_callback_uses_frame_capacity_and_reports_output_saturation(
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,), playback_queue_ms=1),
             callbacks,
-            object(),
+            NULL_LOGGER,
         )
         await client.connect()
         await open_input(client, connection)
@@ -1028,13 +1005,8 @@ def test_slow_output_callback_uses_frame_capacity_and_reports_output_saturation(
             linklab.OutputEndedEvent(linklab.ConversationId(1), linklab.ResponseId(1), linklab.OutputId(1), 21),
         )
         async with asyncio.timeout(1):
-            while client._callback_signals.empty():
+            while client._events.snapshots()[1].overflow_count == 0:
                 await asyncio.sleep(0)
-        signal = client._callback_signals.get_nowait()
-        assert isinstance(signal, _CallbackQueueSaturated)
-        assert signal.path is _CallbackPath.OUTPUT
-        assert isinstance(signal.event, linklab.OutputAudioEvent)
-        assert signal.event.start_frame == 11
         assert client.connection_state is linklab.ConnectionState.READY
         event_snapshot, output_snapshot, control_snapshot = client._events.snapshots()
         assert event_snapshot.overflow_count == 0
@@ -1073,7 +1045,7 @@ def test_client_transport_control_exhaustion_closes_1011(monkeypatch: pytest.Mon
             return fake_handshake(connection)
 
         monkeypatch.setattr("lumivox_linklab._client._open_client_websocket", open_fake)
-        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), NullCallbacks(), object())
+        client = linklab.VoiceClient(linklab.ClientConfig("ws://unused", (PCM_16K,)), NullCallbacks(), NULL_LOGGER)
         await client.connect()
         await open_input(client, connection)
         core = client._core
@@ -1109,6 +1081,7 @@ def test_reconnect_backoff_cleanup_fresh_state_and_close_cancellation(monkeypatc
         monkeypatch.setattr("lumivox_linklab._client._random", lambda: next(random_values))
 
         callbacks = RecordingCallbacks()
+        logger = RecordingLogger()
         client = linklab.VoiceClient(
             linklab.ClientConfig(
                 "ws://unused",
@@ -1118,7 +1091,7 @@ def test_reconnect_backoff_cleanup_fresh_state_and_close_cancellation(monkeypatc
                 reconnect_max_s=3.0,
             ),
             callbacks,
-            object(),
+            logger,
         )
         delays: list[float] = []
         third_delay = asyncio.Event()
@@ -1181,6 +1154,10 @@ def test_reconnect_backoff_cleanup_fresh_state_and_close_cancellation(monkeypatc
         assert open_count == 3
         assert_disconnected(client)
         assert client._callback_task is None
+        events = [event for _, event, _ in logger.records]
+        assert events.count("reconnect_scheduled") == 3
+        assert "reconnect_attempt_failed" in events
+        assert "reconnect_succeeded" in events
 
     run(scenario())
 
@@ -1203,7 +1180,7 @@ def test_reconnect_is_not_attempted_after_policy_or_protocol_close(
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,), reconnect=True),
             NullCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         await client.connect()
         core = client._core
@@ -1241,7 +1218,7 @@ def test_close_cancels_reconnect_handshake(monkeypatch: pytest.MonkeyPatch) -> N
         client = linklab.VoiceClient(
             linklab.ClientConfig("ws://unused", (PCM_16K,), reconnect=True),
             NullCallbacks(),
-            object(),
+            NULL_LOGGER,
         )
         await client.connect()
         core = client._core

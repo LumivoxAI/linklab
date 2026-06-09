@@ -7,6 +7,7 @@ from collections.abc import Coroutine
 import pytest
 
 import lumivox_linklab as linklab
+from tests.helpers import NULL_LOGGER
 
 PCM_16K = linklab.AudioFormat("pcm_s16le", 16_000, 1)
 
@@ -142,12 +143,12 @@ async def open_harness() -> Harness:
         sessions.append(session)
         return handler
 
-    server = linklab.VoiceServer(linklab.ServerConfig(port, (PCM_16K,)), factory, object())
+    server = linklab.VoiceServer(linklab.ServerConfig(port, (PCM_16K,)), factory, NULL_LOGGER)
     await server.serve()
     client = linklab.VoiceClient(
         linklab.ClientConfig(f"ws://127.0.0.1:{port}", (PCM_16K,)),
         callbacks,
-        object(),
+        NULL_LOGGER,
     )
     await client.connect()
     assert client.submit_annotated_audio(linklab.AnnotatedAudio(b"\x01\x02", 0, False, True, True)) is (
