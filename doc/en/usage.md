@@ -145,6 +145,13 @@ Servers advertise `_lumivox-voice._tcp.local.` only after listening; clients wit
 and disables discovery. Discovery is optional, unauthenticated, limited to the
 local multicast domain, and does not replace TLS identity checks.
 
+## Runnable Fake Pipeline
+
+See [`examples/README.md`](../../examples/README.md) for separate client and
+server programs using only public facades. The deterministic loopback path
+demonstrates activation, fake STT/LLM/TTS, streamed PCM, playback accounting,
+barge-in cancellation, re-arm, and clean shutdown without devices or services.
+
 ## Low-Level Codec And Validator
 
 Most applications should use the facades. Tools and non-WebSocket integrations

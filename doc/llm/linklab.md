@@ -30,6 +30,13 @@ on a committed lockfile.
 import lumivox_linklab as linklab
 ```
 
+Runnable bounded client/server integrations are in `examples/`. Start
+`fake_pipeline_server.py` and then `fake_pipeline_client.py` for a deterministic
+loopback demonstration of activation, fake STT/LLM/TTS, playback accounting,
+barge-in cancellation, re-arm, and shutdown. Their matching `--service-id`
+options demonstrate opt-in LAN discovery; the default smoke path uses no mDNS or
+external resources.
+
 The constructors for `VoiceClient` and `VoiceServer` require an object satisfying
 `lumivox_core.logger.Logger`. Linklab directly calls `bind`, `debug`, `info`,
 `warning`, `error`, and `exception`. Do not pass the stdlib logger directly

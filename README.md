@@ -19,6 +19,7 @@ Requirements: Linux and CPython 3.13 or 3.14.
 - [Public API reference](doc/en/api.md)
 - [Operations and security](doc/en/operations.md)
 - [Development](doc/en/development.md)
+- [Runnable fake-pipeline examples](examples/README.md)
 - [LLM integration instructions](doc/llm/linklab.md)
 - [Документация на русском языке](doc/ru/index.md)
 
