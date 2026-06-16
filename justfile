@@ -54,5 +54,15 @@ fixtures_check:
 build:
     uv build --no-sources --clear
 
+# Run the complete release gate on both supported Python versions.
+release:
+    uv sync --frozen
+    uv run --python 3.13 mypy
+    uv run --python 3.13 pytest
+    uv run --python 3.14 pytest
+    just precommit
+    just build
+    uv run python tools/audit_release.py --python 3.13 --python 3.14
+
 # Run the fast, required checks before creating a commit.
 precommit: fmt_check lint typecheck test fixtures_check lock_check

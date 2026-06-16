@@ -43,6 +43,7 @@ source-include = [
     "examples/**",
     "fixtures/**",
     "justfile",
+    "tools/audit_release.py",
     "tools/generate_golden_fixtures.py",
     "uv.lock",
 ]
