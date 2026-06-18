@@ -67,8 +67,9 @@ and must include `PCM_16K`; its order is not a client preference.
 
 ## Concurrency Guarantees
 
-- Construct `VoiceClient`, `VoiceServer`, `ServerSession`, and writers in a
-  running event loop.
+- Construct `VoiceClient` and `VoiceServer` in a running event loop. The server
+  supplies `ServerSession` and writer instances; applications do not construct
+  them or allocate their wire IDs.
 - Async objects bind to their creation loop. Invoke all async methods and read
   loop-owned workflows on that loop. Linklab never creates or owns an event loop.
 - These `VoiceClient` methods are explicitly thread-safe, bounded, synchronous,
@@ -458,3 +459,10 @@ Do not relax these absolute peer-input limits: WebSocket message 262,144 bytes;
 first hello 16,384 bytes; nesting depth 8; map entries 64; array items 32; UTF-8
 string 65,536 bytes; identifier/reason/type 64 bytes; non-audio binary 16,384
 bytes. WebSocket compression is disabled.
+
+## Repository Release Gate
+
+When changing Linklab itself, run `just precommit` and `just build`. Before a
+release, run `just release`; it executes strict mypy on Python 3.13, the complete
+test suite on Python 3.13 and 3.14, builds wheel and sdist, checks their exact
+manifests, and installs the wheel in isolated environments for both versions.

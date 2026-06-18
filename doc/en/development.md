@@ -23,6 +23,7 @@ The supported interpreter range is CPython 3.13 through 3.14 on Linux.
 | `just fixtures_check` | Verify canonical MessagePack golden fixtures. |
 | `just precommit` | Run all required fast checks. |
 | `just build` | Build wheel and sdist without local source overrides. |
+| `just release` | Run the complete Python 3.13/3.14 test, build, manifest, and isolated-install gate. |
 
 Golden fixtures are protocol artifacts. Regenerate them only deliberately with
 `just fixtures`, then review byte changes.
@@ -49,9 +50,9 @@ installation, public API, configuration, lifecycle, concurrency, security,
 observability, or development workflow, update the affected English, Russian,
 README, and LLM documentation in the same task.
 
-Before considering a change complete, run:
+Before considering normal changes complete, run `just precommit` and `just build`.
+Before a release, run the complete gate:
 
 ```bash
-just precommit
-just build
+just release
 ```

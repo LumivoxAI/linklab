@@ -21,6 +21,7 @@ CPython 3.13-3.14.
 | `just fixtures_check` | Проверить golden fixtures MessagePack. |
 | `just precommit` | Выполнить обязательные быстрые проверки. |
 | `just build` | Собрать wheel и sdist без локальных source overrides. |
+| `just release` | Выполнить полный gate на Python 3.13/3.14 с аудитом и изолированной установкой артефактов. |
 
 Golden fixtures являются артефактами протокола. Обновляйте их явно через
 `just fixtures` и проверяйте изменения байтов.
@@ -42,9 +43,9 @@ Golden fixtures являются артефактами протокола. Об
 безопасность, observability или workflow, в той же задаче обновите README,
 английскую, русскую и LLM-документацию.
 
-Перед завершением изменения запустите:
+Перед завершением обычного изменения запустите `just precommit` и `just build`.
+Перед релизом выполните полный gate:
 
 ```bash
-just precommit
-just build
+just release
 ```
