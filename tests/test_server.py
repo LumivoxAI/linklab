@@ -3,7 +3,7 @@ import time
 import socket
 import asyncio
 import inspect
-from typing import Any, Self, cast, get_type_hints
+from typing import Any, Self, Literal, cast, get_type_hints
 from collections.abc import Coroutine
 
 import pytest
@@ -326,7 +326,7 @@ def test_voice_server_exact_async_surface_and_annotations() -> None:
         assert inspect.iscoroutinefunction(method)
         assert get_type_hints(method)["return"] is type(None)
     assert get_type_hints(linklab.VoiceServer.__aenter__)["return"] is Self
-    assert get_type_hints(linklab.VoiceServer.__aexit__)["return"] is bool
+    assert get_type_hints(linklab.VoiceServer.__aexit__)["return"] == Literal[False]
 
 
 def test_server_close_is_bounded_when_handler_suppresses_cancellation() -> None:

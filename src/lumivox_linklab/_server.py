@@ -1269,7 +1269,7 @@ class VoiceServer:
         await self.serve()
         return self
 
-    async def __aexit__(self, _exc_type: object, _exc: object, _traceback: object) -> bool:
+    async def __aexit__(self, _exc_type: object, _exc: object, _traceback: object) -> Literal[False]:
         await self.close()
         return False
 

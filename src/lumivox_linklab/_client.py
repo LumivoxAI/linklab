@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from enum import StrEnum
 from random import random as _random
-from typing import Self, Protocol, runtime_checkable
+from typing import Self, Literal, Protocol, runtime_checkable
 from threading import Lock
 from contextlib import suppress
 from collections import deque
@@ -349,7 +349,7 @@ class VoiceClient:
         await self.connect()
         return self
 
-    async def __aexit__(self, _exc_type: object, _exc: object, _traceback: object) -> bool:
+    async def __aexit__(self, _exc_type: object, _exc: object, _traceback: object) -> Literal[False]:
         await self.close()
         return False
 
